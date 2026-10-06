@@ -31,7 +31,7 @@ from torch._higher_order_ops.associative_scan import associative_scan_op
 from torch._higher_order_ops.triton_kernel_wrap import triton_kernel_wrapper_mutation
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class_obj
-from torch._library.utils import get_layout_constraint_tag
+from torch._library.utils import get_layout_constraint_tag, zip_schema
 from torch._prims_common import (
     canonicalize_dim,
     canonicalize_dims,
@@ -67,6 +67,7 @@ from torch.utils._triton import has_triton_reduction_ordering
 from .._dynamo.utils import import_submodule
 from . import config, inductor_prims, ir, test_operators  # NOQA: F401
 from .decomposition import decompositions, get_decompositions
+from .fx_utils import get_node_storage
 from .ir import (
     BaseView,
     DtypeView,
@@ -9042,10 +9043,27 @@ def foreach_copy_inplace(destinations, sources, non_blocking=False):
         for destination_name, source in zip(destination_names, sources, strict=True)
     )
     if has_ambiguous_or_repeated_destination or has_cross_destination_read:
-        materialized_sources = [
-            _materialize_destination_backed_view(source, named_destinations)
-            for source in sources
-        ]
+        fx_kwargs = {
+            schema_arg.name: value
+            for schema_arg, value in zip_schema(
+                aten._foreach_copy_.default._schema,
+                V.graph.current_node.args,
+                V.graph.current_node.kwargs,
+            )
+        }
+        destination_storages = OrderedSet(
+            storage
+            for node in fx_kwargs["self"]
+            if (storage := get_node_storage(node)) is not None
+        )
+        materialized_sources = []
+        for source, node in zip(sources, fx_kwargs["src"], strict=True):
+            storage = get_node_storage(node)
+            if storage is not None and storage not in destination_storages:
+                source = _materialize_destination_backed_view(
+                    source, named_destinations
+                )
+            materialized_sources.append(source)
         foreach_copy_inplace_fallback(destinations, materialized_sources, non_blocking)
         return destinations
 

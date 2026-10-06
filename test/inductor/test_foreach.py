@@ -245,6 +245,18 @@ class ForeachTests(TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 0)
 
+    def test_foreach_copy_cross_aliasing_with_view_source(self):
+        def fn(x, y, z):
+            torch._foreach_copy_([x, y], [z, x.T])
+            return x, y
+
+        x = torch.arange(9.0).reshape(3, 3)
+        y = torch.arange(9.0, 18.0).reshape(3, 3)
+        z = torch.arange(18.0, 27.0).reshape(3, 3)
+        expected = fn(x.clone(), y.clone(), z)
+        actual = torch.compile(fn, fullgraph=True)(x.clone(), y.clone(), z)
+        self.assertEqual(actual, expected)
+
     @parametrize("device", ("cpu", GPU_TYPE))
     @parametrize("source_order", ("self_first", "self_last", "cross_first"))
     def test_foreach_copy_cross_aliasing_with_self_source(self, device, source_order):
@@ -1930,7 +1942,7 @@ class NoOpFoldingTests(TestCase):
         gm.recompile()
         self.assertEqual(gm(shifted), expected)
 
-    @parametrize("observer_kind", ("is_set_to", "is_alias_of"))
+    @parametrize("observer_kind", ("is_set_to", "is_alias_of", "overlaps"))
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_internal_storage_identity(
         self, observer_kind, value_kind
@@ -1944,11 +1956,12 @@ class NoOpFoldingTests(TestCase):
         inp = gm.graph.find_nodes(op="placeholder")[0]
         output = gm.graph.find_nodes(op="output")[0]
         source = output.args[0]
-        observer = (
-            aten.is_set_to.default
-            if observer_kind == "is_set_to"
-            else torch._C._is_alias_of
-        )
+        if observer_kind == "is_set_to":
+            observer = aten.is_set_to.default
+        elif observer_kind == "is_alias_of":
+            observer = torch._C._is_alias_of
+        else:
+            observer = torch._C._overlaps
         with gm.graph.inserting_before(output):
             result = gm.graph.call_function(observer, args=(source, inp))
         output.args = (result,)
