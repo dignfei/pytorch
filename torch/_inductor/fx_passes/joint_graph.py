@@ -232,6 +232,7 @@ def remove_no_ops(
                 aten.is_set_to.default,
                 aten.is_pinned.default,
                 aten.is_inference.default,
+                aten._version.default,
                 aten._has_same_storage_numel.default,
                 vars(torch._C)["_is_alias_of"],
                 vars(torch._C)["_overlaps"],
