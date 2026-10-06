@@ -23455,6 +23455,32 @@ class NoOpFoldingTests(InductorTestCase):
         gm.recompile()
         self.assertTrue(gm(shifted, y))
 
+    @requires_cuda
+    @parametrize("value_kind", ("direct", "view"))
+    def test_noop_fold_preserves_pinned_storage(self, value_kind):
+        def fn(x):
+            value = x * 1.0
+            return value.view_as(value) if value_kind == "view" else value
+
+        x = torch.empty(2, pin_memory=True)
+        x.fill_(1.0)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            pinned = gm.graph.call_function(
+                aten.is_pinned.default, args=(output.args[0],)
+            )
+        output.args = (pinned,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        constant_fold_uniform_value(gm)
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
+        )
+        gm.recompile()
+        self.assertFalse(gm(x))
+
     @parametrize("transfer_kind", ("tensor", "storage_offset"))
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_set_source_allocation(self, transfer_kind, value_kind):
