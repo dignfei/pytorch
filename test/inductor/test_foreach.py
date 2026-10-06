@@ -1633,6 +1633,27 @@ class ForeachTests(TestCase):
 
 @instantiate_parametrized_tests
 class NoOpFoldingTests(TestCase):
+    def test_noop_fold_preserves_functional_set_source_allocation(self):
+        def fn(x):
+            value = x * 1
+            return aten.set.source_Tensor(torch.empty(0), value)
+
+        x = torch.tensor([1, 2])
+        gm = make_fx(fn, tracing_mode="real")(x)
+        inp = gm.graph.find_nodes(op="placeholder")[0]
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            observer = gm.graph.call_function(
+                torch._C._is_alias_of, args=(output.args[0], inp)
+            )
+        output.args = (observer,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        constant_fold_uniform_value(gm)
+        gm.recompile()
+        self.assertFalse(gm(x))
+
     @parametrize("mutation_kind", ("view", "out_keyword"))
     def test_noop_source_retained_through_alias_mutation(self, mutation_kind):
         def fn(x, y):

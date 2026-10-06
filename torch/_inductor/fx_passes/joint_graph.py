@@ -236,6 +236,8 @@ def remove_no_ops(
             ):
                 observed_inputs = current.all_input_nodes
             elif current.target in (
+                aten.set.source_Tensor,
+                aten.set.source_Tensor_out,
                 aten.set_.source_Tensor,
                 aten.set_.source_Tensor_storage_offset,
             ):
