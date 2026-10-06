@@ -224,8 +224,9 @@ def remove_no_ops(
                     layout_sensitive_inputs.add(input_node)
                     input_node = alias_base(input_node)
 
-        # Storage identity and transfers are observable through views, but not
-        # through a subsequent allocating operation. Only follow view provenance.
+        # TensorImpl state, storage identity, and transfers are observable
+        # through views, but not through an allocating operation. Follow only
+        # view provenance to avoid retaining unrelated upstream allocations.
         allocation_sensitive_inputs: OrderedSet[torch.fx.Node] = OrderedSet()
         for current in graph.nodes:
             if current.target in (
@@ -233,6 +234,8 @@ def remove_no_ops(
                 aten.is_pinned.default,
                 aten.is_inference.default,
                 aten.is_leaf.default,
+                aten.retains_grad.default,
+                aten.output_nr.default,
                 aten._version.default,
                 aten._has_same_storage_numel.default,
                 vars(torch._C)["_is_alias_of"],

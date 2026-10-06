@@ -23486,6 +23486,48 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
+    @parametrize("value_kind", ("direct", "view"))
+    def test_noop_fold_preserves_retained_grad_state(self, value_kind):
+        def fn(x):
+            value = x * 1.0
+            return value.view_as(value) if value_kind == "view" else value
+
+        x = torch.ones(2, requires_grad=True) * 2
+        x.retain_grad()
+        gm = make_fx(fn, tracing_mode="real")(x)
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            retained = gm.graph.call_function(
+                aten.retains_grad.default, args=(output.args[0],)
+            )
+        output.args = (retained,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(x))
+
+    @parametrize("value_kind", ("direct", "view"))
+    def test_noop_fold_preserves_autograd_output_number(self, value_kind):
+        def fn(x):
+            value = x * 1.0
+            return value.view_as(value) if value_kind == "view" else value
+
+        x = torch.ones(2, requires_grad=True).unbind()[1]
+        self.assertEqual(aten.output_nr.default(x), 1)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            output_number = gm.graph.call_function(
+                aten.output_nr.default, args=(output.args[0],)
+            )
+        output.args = (output_number,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertEqual(gm(x), 0)
+        self.fold_and_check_mul(gm)
+        self.assertEqual(gm(x), 0)
+
     @parametrize("transfer_kind", ("tensor", "storage_offset"))
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_set_source_allocation(self, transfer_kind, value_kind):
