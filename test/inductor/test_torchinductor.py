@@ -23054,6 +23054,14 @@ def _run_and_get_stripped_kernels(
 
 @instantiate_parametrized_tests
 class NoOpFoldingTests(InductorTestCase):
+    def fold_and_check_mul(self, gm, expected_count=1):
+        constant_fold_uniform_value(gm)
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)),
+            expected_count,
+        )
+        gm.recompile()
+
     def test_noop_fold_preserves_functional_set_source_allocation(self):
         def fn(x):
             value = x * 1
@@ -23071,8 +23079,7 @@ class NoOpFoldingTests(InductorTestCase):
         gm.graph.lint()
         gm.recompile()
         self.assertFalse(gm(x))
-        constant_fold_uniform_value(gm)
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
     @parametrize("mutation_kind", ("view", "out_keyword"))
@@ -23089,18 +23096,13 @@ class NoOpFoldingTests(InductorTestCase):
         y = torch.tensor([2.0])
         expected = fn(x.clone(), y.clone())
         gm = make_fx(fn, tracing_mode="real")(x.clone(), y.clone())
-        constant_fold_uniform_value(gm)
-        retained_mul_count = len(
-            gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)
-        )
+        self.fold_and_check_mul(gm)
         if mutation_kind == "view":
             actual = compile_fx_inner(gm, [x, y])([x.clone(), y.clone()])
         else:
             # The FX transform is exercised directly; Inductor cannot lower aten.add.out.
-            gm.recompile()
             actual = gm(x.clone(), y.clone())
         self.assertEqual(actual, expected)
-        self.assertEqual(retained_mul_count, 1)
 
     @parametrize("view_kind", ("split", "unbind"))
     def test_noop_source_retained_through_multi_output_view(self, view_kind):
@@ -23115,13 +23117,9 @@ class NoOpFoldingTests(InductorTestCase):
         x = torch.tensor([1.0, 2.0])
         expected = fn(x.clone())
         gm = make_fx(fn, tracing_mode="real")(x.clone())
-        constant_fold_uniform_value(gm)
-        retained_mul_count = len(
-            gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)
-        )
+        self.fold_and_check_mul(gm)
         actual = compile_fx_inner(gm, [x])([x.clone()])
         self.assertEqual(actual, expected)
-        self.assertEqual(retained_mul_count, 1)
 
     def test_noop_result_mutation_keeps_input_unmodified(self):
         def fn(x):
@@ -23132,13 +23130,9 @@ class NoOpFoldingTests(InductorTestCase):
         x = torch.tensor([1.0, 2.0])
         expected = fn(x.clone())
         gm = make_fx(fn, tracing_mode="real")(x.clone())
-        constant_fold_uniform_value(gm)
-        retained_mul_count = len(
-            gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)
-        )
+        self.fold_and_check_mul(gm)
         actual = compile_fx_inner(gm, [x])([x.clone()])
         self.assertEqual(actual, expected)
-        self.assertEqual(retained_mul_count, 1)
 
     @parametrize("mutation_kind", ("base", "sibling_view", "split_base"))
     def test_noop_source_retained_when_alias_base_mutates(self, mutation_kind):
@@ -23154,13 +23148,9 @@ class NoOpFoldingTests(InductorTestCase):
         x = torch.tensor([1.0, 2.0])
         expected = fn(x.clone())
         gm = make_fx(fn, tracing_mode="real")(x.clone())
-        constant_fold_uniform_value(gm)
-        retained_mul_count = len(
-            gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)
-        )
+        self.fold_and_check_mul(gm)
         actual = compile_fx_inner(gm, [x])([x.clone()])
         self.assertEqual(actual, expected)
-        self.assertEqual(retained_mul_count, 1)
 
     def test_noop_fold_handles_long_view_chain(self):
         def fn(x):
@@ -23172,12 +23162,8 @@ class NoOpFoldingTests(InductorTestCase):
 
         x = torch.tensor([1.0])
         gm = make_fx(fn, tracing_mode="real")(x.clone())
-        constant_fold_uniform_value(gm)
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(x.clone()), fn(x.clone()))
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
 
     @parametrize("view_kind", ("permute", "unbind"))
     def test_noop_source_retained_through_keyword_view(self, view_kind):
@@ -23203,14 +23189,9 @@ class NoOpFoldingTests(InductorTestCase):
             **({"dims": [0]} if view_kind == "permute" else {"dim": 0}),
         }
         gm.graph.lint()
-        constant_fold_uniform_value(gm)
-        retained_mul_count = len(
-            gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)
-        )
+        self.fold_and_check_mul(gm)
         # Inductor cannot lower keyword-form views yet; execute the real folded FX graph.
-        gm.recompile()
         self.assertEqual(gm(x.clone()), expected)
-        self.assertEqual(retained_mul_count, 1)
 
     @parametrize("device", ("cpu", GPU_TYPE))
     @parametrize("result_kind", ("input", "input_view", "other_output", "output_view"))
@@ -23263,11 +23244,7 @@ class NoOpFoldingTests(InductorTestCase):
         original = source.clone()
         gm = make_fx(fn, tracing_mode="real")()
         self.assertEqual(len(gm.graph.find_nodes(op="get_attr")), 1)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         actual = gm()[0]
         actual.add_(7)
         self.assertEqual(source, original)
@@ -23285,11 +23262,7 @@ class NoOpFoldingTests(InductorTestCase):
         base = torch.tensor([11.0, 22.0, 33.0, 44.0, 55.0, 66.0])
         expected = fn(base.clone())
         gm = make_fx(fn, tracing_mode="real")(base.clone())
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(base.clone()), expected)
 
     def test_noop_fold_preserves_runtime_input_offset(self):
@@ -23302,11 +23275,7 @@ class NoOpFoldingTests(InductorTestCase):
         shifted = base[1:]
         expected = fn(shifted)
         self.assertEqual(gm(shifted), expected)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(shifted), expected)
 
     @parametrize("view_kind", ("direct", "chained"))
@@ -23330,11 +23299,7 @@ class NoOpFoldingTests(InductorTestCase):
         shifted = base[1:3]
         expected = fn(shifted)
         self.assertEqual(gm(shifted), expected)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(shifted), expected)
 
     @parametrize("value_kind", ("direct", "view"))
@@ -23358,11 +23323,7 @@ class NoOpFoldingTests(InductorTestCase):
         shifted = base[1:3]
         expected = fn(shifted)
         self.assertEqual(gm(shifted), expected)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(shifted), expected)
 
     @parametrize("boundary_kind", ("add", "clone"))
@@ -23377,11 +23338,7 @@ class NoOpFoldingTests(InductorTestCase):
         shifted = base[1:3]
         expected = fn(shifted)
         self.assertEqual(gm(shifted), expected)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 0
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm, 0)
         self.assertEqual(gm(shifted), expected)
 
     @parametrize(
@@ -23420,11 +23377,7 @@ class NoOpFoldingTests(InductorTestCase):
         gm.graph.lint()
         gm.recompile()
         self.assertFalse(gm(x.clone()))
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertFalse(gm(x.clone()))
 
     @parametrize("value_kind", ("direct", "view"))
@@ -23448,11 +23401,7 @@ class NoOpFoldingTests(InductorTestCase):
 
         shifted = torch.tensor([1.0, 2.0, 3.0, 4.0])[:2]
         self.assertTrue(gm(shifted, y))
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertTrue(gm(shifted, y))
 
     @requires_cuda
@@ -23474,11 +23423,7 @@ class NoOpFoldingTests(InductorTestCase):
         gm.graph.lint()
         gm.recompile()
         self.assertFalse(gm(x))
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
     @parametrize("value_kind", ("direct", "view"))
@@ -23499,11 +23444,7 @@ class NoOpFoldingTests(InductorTestCase):
         gm.graph.lint()
         gm.recompile()
         self.assertFalse(gm(x))
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
     @parametrize("value_kind", ("direct", "view"))
@@ -23524,12 +23465,26 @@ class NoOpFoldingTests(InductorTestCase):
         gm.graph.lint()
         gm.recompile()
         self.assertEqual(gm(x), 0)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(x), 0)
+
+    @parametrize("value_kind", ("direct", "view"))
+    def test_noop_fold_preserves_leaf_state(self, value_kind):
+        def fn(x):
+            value = x * 1.0
+            return value.view_as(value) if value_kind == "view" else value
+
+        x = torch.ones(2, requires_grad=True)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            leaf = gm.graph.call_function(aten.is_leaf.default, args=(output.args[0],))
+        output.args = (leaf,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(x))
 
     @parametrize("transfer_kind", ("tensor", "storage_offset"))
     @parametrize("value_kind", ("direct", "view"))
@@ -23557,11 +23512,7 @@ class NoOpFoldingTests(InductorTestCase):
             gm.graph.lint()
             gm.recompile()
         self.assertEqual(gm(x.clone()), expected)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(x.clone()), expected)
 
     @parametrize("observer_kind", ("offset", "sym_offset", "scatter", "copy"))
@@ -23596,11 +23547,7 @@ class NoOpFoldingTests(InductorTestCase):
             gm.recompile()
             expected = op(base[1:5] * 1.0)
         self.assertEqual(gm(base.clone()), expected)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(base.clone()), expected)
 
     @parametrize("view_kind", ("conj", "neg"))
@@ -23627,11 +23574,7 @@ class NoOpFoldingTests(InductorTestCase):
         gm.graph.lint()
         gm.recompile()
         self.assertEqual(gm(x.clone()), expected)
-        constant_fold_uniform_value(gm)
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        gm.recompile()
+        self.fold_and_check_mul(gm)
         self.assertEqual(gm(x.clone()), expected)
 
 
