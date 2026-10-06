@@ -233,6 +233,8 @@ def remove_no_ops(
                 aten._has_same_storage_numel.default,
                 vars(torch._C)["_is_alias_of"],
                 vars(torch._C)["_overlaps"],
+                vars(torch._C)["_storage_id"],
+                vars(torch._C)["_storage_address"],
             ):
                 observed_inputs = current.all_input_nodes
             elif current.target in (

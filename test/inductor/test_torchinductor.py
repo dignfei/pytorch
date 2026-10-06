@@ -23384,7 +23384,10 @@ class NoOpFoldingTests(InductorTestCase):
         gm.recompile()
         self.assertEqual(gm(shifted), expected)
 
-    @parametrize("observer_kind", ("is_set_to", "is_alias_of", "overlaps"))
+    @parametrize(
+        "observer_kind",
+        ("is_set_to", "is_alias_of", "overlaps", "storage_id", "storage_address"),
+    )
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_internal_storage_identity(
         self, observer_kind, value_kind
@@ -23402,10 +23405,17 @@ class NoOpFoldingTests(InductorTestCase):
             observer = aten.is_set_to.default
         elif observer_kind == "is_alias_of":
             observer = torch._C._is_alias_of
+        elif observer_kind in ("storage_id", "storage_address"):
+            observer = getattr(torch._C, f"_{observer_kind}")
         else:
             observer = torch._C._overlaps
         with gm.graph.inserting_before(output):
-            result = gm.graph.call_function(observer, args=(source, inp))
+            if observer_kind in ("storage_id", "storage_address"):
+                value_id = gm.graph.call_function(observer, args=(source,))
+                input_id = gm.graph.call_function(observer, args=(inp,))
+                result = gm.graph.call_function(operator.eq, args=(value_id, input_id))
+            else:
+                result = gm.graph.call_function(observer, args=(source, inp))
         output.args = (result,)
         gm.graph.lint()
         gm.recompile()
