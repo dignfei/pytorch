@@ -9701,22 +9701,23 @@ class Scheduler:
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         candidate_nodes = (node1, node2)
-        for node_with_mutations in candidate_nodes:
-            for mutating_node in node_with_mutations.get_nodes():
-                for weak_dep in mutating_node._pruned_weak_deps:
-                    reading_node = next(
-                        (
-                            leaf
-                            for node in candidate_nodes
-                            for leaf in node.get_nodes()
-                            if weak_dep.name in leaf.get_buffer_names()
-                        ),
-                        None,
-                    )
-                    if reading_node is not None and not self.fusable_weak_dep(
-                        weak_dep, reading_node, mutating_node
-                    ):
-                        return False
+        candidate_leaves = tuple(
+            leaf for node in candidate_nodes for leaf in node.get_nodes()
+        )
+        for mutating_node in candidate_leaves:
+            for weak_dep in mutating_node._pruned_weak_deps:
+                reading_node = next(
+                    (
+                        leaf
+                        for leaf in candidate_leaves
+                        if weak_dep.name in leaf.get_buffer_names()
+                    ),
+                    None,
+                )
+                if reading_node is not None and not self.fusable_weak_dep(
+                    weak_dep, reading_node, mutating_node
+                ):
+                    return False
         return True
 
     def shared_data_after_reordering_loop(

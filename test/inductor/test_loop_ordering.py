@@ -794,7 +794,9 @@ class LoopOrderingTest(TestCase):
             self.assertEqual(len(nodes), 1)
             self.assertIsInstance(nodes[0], FusedSchedulerNode)
             self.assertEqual(len(nodes[0].get_nodes()), 3)
-            self.assertEqual(len(list(nodes[0].iter_pruned_weak_deps())), 1)
+            self.assertEqual(
+                sum(len(leaf._pruned_weak_deps) for leaf in nodes[0].get_nodes()), 1
+            )
             return nodes
 
         x = torch.rand(1024, device=self.device)
