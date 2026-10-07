@@ -137,37 +137,49 @@ def remove_no_ops(
                 if had_meta_return:
                     graph.eliminate_dead_code()
 
-        def has_identity_candidate():
-            for node in graph.nodes:
-                if node.op != "call_function" or len(node.args) != 2:
-                    continue
-                if node.target in (aten.add.Tensor, aten.sub.Tensor):
-                    identity = zeros
-                    scalar = 0
-                elif node.target in (aten.mul.Tensor, aten.div.Tensor):
-                    identity = ones
-                    scalar = 1
-                else:
-                    continue
-                if (
-                    node.target in (aten.add.Tensor, aten.sub.Tensor)
-                    and node.kwargs.get("alpha", 1) != 1
-                ):
-                    continue
-                args = (
-                    node.args
-                    if node.target in (aten.add.Tensor, aten.mul.Tensor)
-                    else node.args[1:]
-                )
-                if any(
-                    (isinstance(arg, torch.fx.Node) and arg in identity)
-                    or (isinstance(arg, (int, float)) and arg == scalar)
-                    for arg in args
-                ):
-                    return True
-            return False
+        def matches_identity(arg, known, scalar):
+            return (isinstance(arg, torch.fx.Node) and arg in known) or (
+                isinstance(arg, (int, float)) and arg == scalar
+            )
 
-        if not has_identity_candidate():
+        def identity_replacement_index(node):
+            if len(node.args) != 2:
+                return None
+            left, right = node.args
+            if node.target in (aten.add.Tensor, aten.sub.Tensor):
+                if node.kwargs.get("alpha", 1) != 1:
+                    return None
+                matches = functools.partial(matches_identity, known=zeros, scalar=0)
+            else:
+                matches = functools.partial(matches_identity, known=ones, scalar=1)
+
+            if node.target in (aten.sub.Tensor, aten.div.Tensor):
+                return 0 if matches(right) else None
+            if not (matches(left) or matches(right)):
+                return None
+            index = 1 if matches(left) else 0
+            if node.target is aten.add.Tensor:
+                replacement = node.args[index]
+                if isinstance(replacement, torch.fx.Node):
+                    val = replacement.meta.get("val")
+                    if isinstance(val, torch.Tensor) and val.is_conj():
+                        return None
+            return index
+
+        # Match once, in the original per-target pass order, and reuse the
+        # candidates after constructing the allocation and alias indexes.
+        candidates = [
+            (node, index)
+            for target in (
+                aten.add.Tensor,
+                aten.sub.Tensor,
+                aten.mul.Tensor,
+                aten.div.Tensor,
+            )
+            for node in graph.find_nodes(op="call_function", target=target)
+            if (index := identity_replacement_index(node)) is not None
+        ]
+        if not candidates:
             rewrite_meta_outputs()
             return
 
@@ -389,9 +401,6 @@ def remove_no_ops(
         def is_mutated(n):
             return alias_root(n) in mutated_roots
 
-        def isScalarValue(arg):
-            return isinstance(arg, (int, float))
-
         def replace_no_op(node, replace_input_index):
             nonlocal output_index_dirty
             replacement = node.args[replace_input_index]
@@ -400,9 +409,9 @@ def remove_no_ops(
             # non-Tensor inputs even for ops with only Tensor inputs.
             # TODO - decompose/type promote to avoid this
             if not all(isinstance(arg, torch.fx.Node) for arg in node.args):
-                if all(isScalarValue(arg) for arg in node.args) or not isinstance(
-                    replacement, torch.fx.Node
-                ):
+                if all(
+                    isinstance(arg, (int, float)) for arg in node.args
+                ) or not isinstance(replacement, torch.fx.Node):
                     return
 
             # https://github.com/pytorch/pytorch/issues/174187
@@ -447,63 +456,8 @@ def remove_no_ops(
             ):
                 output_index_dirty = True
 
-        for node in graph.find_nodes(op="call_function", target=aten.add.Tensor):
-            if len(node.args) == 2:
-                if (
-                    not any(
-                        e in zeros or (isScalarValue(e) and e == 0) for e in node.args
-                    )
-                    or node.kwargs.get("alpha", 1) != 1
-                ):
-                    continue
-
-                replace_index = (
-                    1
-                    if node.args[0] in zeros
-                    or (isScalarValue(node.args[0]) and node.args[0] == 0)
-                    else 0
-                )
-                replacement = node.args[replace_index]
-                if isinstance(replacement, torch.fx.Node):
-                    val = replacement.meta.get("val")
-                    if isinstance(val, torch.Tensor) and val.is_conj():
-                        continue
-                replace_no_op(node, replace_index)
-
-        for node in graph.find_nodes(op="call_function", target=aten.sub.Tensor):
-            if len(node.args) == 2:
-                if (
-                    not (
-                        node.args[1] in zeros
-                        or (isScalarValue(node.args[1]) and node.args[1] == 0)
-                    )
-                    or node.kwargs.get("alpha", 1) != 1
-                ):
-                    continue
-
-                replace_no_op(node, 0)
-
-        for node in graph.find_nodes(op="call_function", target=aten.mul.Tensor):
-            if len(node.args) == 2:
-                if not any(
-                    e in ones or (isScalarValue(e) and e == 1) for e in node.args
-                ):
-                    continue
-
-                replace_input_index = (
-                    1
-                    if node.args[0] in ones
-                    or (isScalarValue(node.args[0]) and node.args[0] == 1)
-                    else 0
-                )
-                replace_no_op(node, replace_input_index)
-
-        for node in graph.find_nodes(op="call_function", target=aten.div.Tensor):
-            if len(node.args) == 2 and (
-                node.args[1] in ones
-                or (isScalarValue(node.args[1]) and node.args[1] == 1)
-            ):
-                replace_no_op(node, 0)
+        for node, index in candidates:
+            replace_no_op(node, index)
 
         rewrite_meta_outputs()
 
