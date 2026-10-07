@@ -23155,6 +23155,30 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
+    def test_noop_fold_preserves_lifted_storage_observer(self):
+        def fn(x):
+            return aten.alias.default(x * 1.0)
+
+        x = torch.ones(2)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        # Tracing the identity lift removes it; retain an alias node and then
+        # test the real native lift target and its storage provenance.
+        gm.graph.find_nodes(op="call_function", target=aten.alias.default)[
+            0
+        ].target = aten.lift.default
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            observed = gm.graph.call_function(
+                aten.is_set_to.default,
+                args=(output.args[0], gm.graph.find_nodes(op="placeholder")[0]),
+            )
+        output.args = (observed,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(x))
+
     @parametrize("mutation_kind", ("view", "out_keyword"))
     def test_noop_source_retained_through_alias_mutation(self, mutation_kind):
         def fn(x, y):

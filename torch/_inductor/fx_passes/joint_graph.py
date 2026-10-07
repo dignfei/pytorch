@@ -236,11 +236,12 @@ def remove_no_ops(
             return None
 
         def is_view_target(target):
-            # _unsafe_view and aten.data share storage despite omitting schema
-            # alias metadata.
-            return target in (aten._unsafe_view.default, aten.data.default) or (
-                _is_view_op(target) is True
-            )
+            # These share storage despite omitting schema alias metadata.
+            return target in (
+                aten._unsafe_view.default,
+                aten.data.default,
+                aten.lift.default,
+            ) or (_is_view_op(target) is True)
 
         def alias_base(node):
             if is_view_target(node.target):
