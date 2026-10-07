@@ -334,13 +334,15 @@ def remove_no_ops(
                 aten.set.source_Tensor_out,
                 aten.set_.source_Tensor,
                 aten.set_.source_Tensor_storage_offset,
+                aten.set_data.default,
             ):
                 observed_inputs = [
                     value
                     for schema_arg, value in zip_schema(
                         current.target._schema, current.args, current.kwargs
                     )
-                    if schema_arg.name == "source" and isinstance(value, torch.fx.Node)
+                    if schema_arg.name in ("source", "new_data")
+                    and isinstance(value, torch.fx.Node)
                 ]
             else:
                 continue

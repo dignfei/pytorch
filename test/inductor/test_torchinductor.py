@@ -23109,6 +23109,28 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
+    def test_noop_fold_preserves_set_data_source_allocation(self):
+        def fn(x):
+            value = x * 1.0
+            return torch.empty(0), value
+
+        x = torch.ones(2)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        output = gm.graph.find_nodes(op="output")[0]
+        destination, value = output.args[0]
+        with gm.graph.inserting_before(output):
+            gm.graph.call_function(aten.set_data.default, args=(destination, value))
+            observed = gm.graph.call_function(
+                torch._C._is_alias_of,
+                args=(destination, gm.graph.find_nodes(op="placeholder")[0]),
+            )
+        output.args = (observed,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(x))
+
     @parametrize("mutation_kind", ("view", "out_keyword"))
     def test_noop_source_retained_through_alias_mutation(self, mutation_kind):
         def fn(x, y):
