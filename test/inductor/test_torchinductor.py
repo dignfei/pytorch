@@ -23377,7 +23377,13 @@ class NoOpFoldingTests(InductorTestCase):
 
     @parametrize(
         "observer_kind",
-        ("is_set_to", "is_alias_of", "overlaps", "storage_id", "storage_address"),
+        (
+            "is_set_to",
+            "is_alias_of",
+            "overlaps",
+            "storage_id",
+            "storage_address",
+        ),
     )
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_internal_storage_identity(
@@ -23478,6 +23484,35 @@ class NoOpFoldingTests(InductorTestCase):
     def test_noop_fold_preserves_data_ptr(self, value_kind):
         x = torch.tensor([1.0, 2.0])
         self.check_tensor_observer(x, "data_ptr", value_kind, False, True)
+
+    def test_noop_fold_preserves_is_view(self):
+        x = torch.ones(4)[1:3]
+        self.assertTrue(x._is_view())
+        self.check_tensor_observer(x, "_is_view", "direct", False)
+
+    def test_noop_fold_preserves_tensor_impl_handle(self):
+        def fn(x):
+            return x * 1.0
+
+        x = torch.ones(2)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        inp = gm.graph.find_nodes(op="placeholder")[0]
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            handle = gm.graph.call_function(
+                torch._C._tensor_impl_raw_handle, args=(output.args[0],)
+            )
+            wrapped = gm.graph.call_function(torch._C._wrap_tensor_impl, args=(handle,))
+            aliases_input = gm.graph.call_function(
+                torch._C._is_alias_of, args=(wrapped, inp)
+            )
+        output.args = (aliases_input,)
+        gm.graph.lint()
+        gm.recompile()
+
+        self.assertFalse(gm(x))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(x))
 
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_incremented_version_target(self, value_kind):

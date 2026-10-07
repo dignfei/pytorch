@@ -243,10 +243,14 @@ def remove_no_ops(
                 vars(torch._C)["_overlaps"],
                 vars(torch._C)["_storage_id"],
                 vars(torch._C)["_storage_address"],
+                vars(torch._C)["_tensor_impl_raw_handle"],
                 vars(torch._C)["_increment_version"],
             ):
                 observed_inputs = current.all_input_nodes
-            elif current.op == "call_method" and current.target == "data_ptr":
+            elif current.op == "call_method" and current.target in (
+                "data_ptr",
+                "_is_view",
+            ):
                 observed_inputs = current.all_input_nodes
             elif current.target in (
                 aten.set.source_Tensor,
