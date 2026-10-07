@@ -141,6 +141,7 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.logging_utils import logs_to_string
 from torch.utils import _pytree as pytree
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from torch.utils.weak import WeakTensorKeyDictionary
@@ -153,7 +154,10 @@ importlib.import_module("filelock")
 
 from torch._inductor import config, cpu_vec_isa, test_operators
 from torch._inductor.compile_fx import compile_fx, compile_fx_inner, FxCompileMode
-from torch._inductor.fx_passes.joint_graph import constant_fold_uniform_value
+from torch._inductor.fx_passes.joint_graph import (
+    constant_fold_uniform_value,
+    remove_no_ops,
+)
 from torch._inductor.utils import has_torchvision_roi_align
 from torch.testing._internal.common_utils import slowTest
 from torch.testing._internal.inductor_utils import (  # noqa: F401
@@ -23496,6 +23500,31 @@ class NoOpFoldingTests(InductorTestCase):
         self.assertEqual(gm(x.clone()), 0)
         self.fold_and_check_mul(gm)
         self.assertEqual(gm(x.clone()), 0)
+
+    def test_noop_fold_preserves_zerotensor_state(self):
+        def fn(x):
+            return x + torch.zeros_like(x)
+
+        x = aten._efficientzerotensor.default([2], dtype=torch.float, device="cpu")
+        gm = make_fx(fn, tracing_mode="real")(torch.ones(2))
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            is_zero = gm.graph.call_function(
+                aten._is_zerotensor.default, args=(output.args[0],)
+            )
+        output.args = (is_zero,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        zero = gm.graph.find_nodes(op="call_function", target=aten.zeros_like.default)[
+            0
+        ]
+        remove_no_ops(gm, OrderedSet([zero]), OrderedSet())
+        gm.recompile()
+        self.assertFalse(gm(x))
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.add.Tensor)), 1
+        )
 
     @parametrize("transfer_kind", ("tensor", "storage_offset"))
     @parametrize("value_kind", ("direct", "view"))

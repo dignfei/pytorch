@@ -234,6 +234,7 @@ def remove_no_ops(
                 aten.is_pinned.default,
                 aten.is_inference.default,
                 aten.is_leaf.default,
+                aten._is_zerotensor.default,
                 aten.retains_grad.default,
                 aten.output_nr.default,
                 aten._version.default,
