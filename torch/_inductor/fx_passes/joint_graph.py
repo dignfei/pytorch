@@ -236,8 +236,11 @@ def remove_no_ops(
             return None
 
         def is_view_target(target):
-            # _unsafe_view shares storage despite omitting schema alias metadata.
-            return target is aten._unsafe_view.default or _is_view_op(target) is True
+            # _unsafe_view and aten.data share storage despite omitting schema
+            # alias metadata.
+            return target in (aten._unsafe_view.default, aten.data.default) or (
+                _is_view_op(target) is True
+            )
 
         def alias_base(node):
             if is_view_target(node.target):
@@ -290,16 +293,6 @@ def remove_no_ops(
             aten.view.dtype,
             aten.view_copy.dtype,
         )
-        layout_sensitive_inputs: OrderedSet[torch.fx.Node] = OrderedSet()
-        for current in graph.nodes:
-            if current.target in layout_observers:
-                input_node = first_tensor_input(current)
-                while (
-                    input_node is not None and input_node not in layout_sensitive_inputs
-                ):
-                    layout_sensitive_inputs.add(input_node)
-                    input_node = alias_base(input_node)
-
         # TensorImpl state, storage identity, and transfers are observable
         # through views, but not through an allocating operation. Follow only
         # view provenance to avoid retaining unrelated upstream allocations.
@@ -308,7 +301,9 @@ def remove_no_ops(
         # native or custom identity observer and mutator.
         allocation_sensitive_inputs: OrderedSet[torch.fx.Node] = OrderedSet()
         for current in graph.nodes:
-            if current.target in (
+            if current.target in layout_observers:
+                observed_inputs = [first_tensor_input(current)]
+            elif current.target in (
                 aten.is_set_to.default,
                 aten.is_pinned.default,
                 aten.is_inference.default,
@@ -347,7 +342,10 @@ def remove_no_ops(
             else:
                 continue
             for input_node in observed_inputs:
-                while input_node not in allocation_sensitive_inputs:
+                while (
+                    input_node is not None
+                    and input_node not in allocation_sensitive_inputs
+                ):
                     allocation_sensitive_inputs.add(input_node)
                     if (base := alias_base(input_node)) is None:
                         break
@@ -423,7 +421,6 @@ def remove_no_ops(
                 or is_mutated(node)
                 or changes_output_aliases(node, replacement)
                 or replacement in unresolved_bit_views
-                or node in layout_sensitive_inputs
                 or node in allocation_sensitive_inputs
             ):
                 return

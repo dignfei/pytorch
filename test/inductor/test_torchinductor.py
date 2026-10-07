@@ -23131,6 +23131,30 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
+    def test_noop_fold_preserves_data_view_observer(self):
+        def fn(x):
+            return aten.data.default(x * 1.0)
+
+        x = torch.ones(2)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        # make_fx normalizes aten.data to aten.alias; restore the real target
+        # so this case checks its missing schema alias metadata.
+        gm.graph.find_nodes(op="call_function", target=aten.alias.default)[
+            0
+        ].target = aten.data.default
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            observed = gm.graph.call_function(
+                aten.is_set_to.default,
+                args=(output.args[0], gm.graph.find_nodes(op="placeholder")[0]),
+            )
+        output.args = (observed,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(gm(x))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(x))
+
     @parametrize("mutation_kind", ("view", "out_keyword"))
     def test_noop_source_retained_through_alias_mutation(self, mutation_kind):
         def fn(x, y):
