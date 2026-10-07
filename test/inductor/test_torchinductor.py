@@ -23712,11 +23712,14 @@ class NoOpFoldingTests(InductorTestCase):
             "contiguous",
             "contiguous_memory_format",
             "sym_contiguous",
+            "internal_overlap",
         ),
     )
     def test_noop_fold_preserves_layout_observers(self, observer_kind):
         observes_runtime_layout = (
-            "stride" in observer_kind or "contiguous" in observer_kind
+            "stride" in observer_kind
+            or "contiguous" in observer_kind
+            or observer_kind == "internal_overlap"
         )
 
         def fn(base):
@@ -23731,7 +23734,13 @@ class NoOpFoldingTests(InductorTestCase):
 
         base = torch.tensor([11.0, 22.0, 33.0, 44.0, 55.0, 66.0])
         trace_input = base[:3].clone() if observes_runtime_layout else base.clone()
-        runtime_input = base[::2] if observes_runtime_layout else base.clone()
+        runtime_input = (
+            base[:1].expand(3)
+            if observer_kind == "internal_overlap"
+            else base[::2]
+            if observes_runtime_layout
+            else base.clone()
+        )
         gm = make_fx(fn, tracing_mode="real")(trace_input)
         if observer_kind in ("scatter", "copy"):
             expected = fn(runtime_input)
@@ -23756,6 +23765,7 @@ class NoOpFoldingTests(InductorTestCase):
                     aten.sym_is_contiguous.default,
                     (torch.contiguous_format,),
                 ),
+                "internal_overlap": (aten._debug_has_internal_overlap.default, ()),
             }[observer_kind]
             with gm.graph.inserting_before(output):
                 observed = gm.graph.call_function(op, args=(mul, *args))

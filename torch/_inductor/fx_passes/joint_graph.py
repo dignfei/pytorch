@@ -293,6 +293,7 @@ def remove_no_ops(
             aten.as_strided.default,
             aten.as_strided_copy.default,
             aten.as_strided_scatter.default,
+            aten._debug_has_internal_overlap.default,
             aten.is_contiguous.default,
             aten.is_contiguous.memory_format,
             aten.storage_offset.default,
@@ -361,6 +362,7 @@ def remove_no_ops(
         output_roots: Counter[torch.fx.Node] = Counter()
         output_storages: Counter[int] = Counter()
         output_pairs: Counter[tuple[torch.fx.Node, int | None]] = Counter()
+        direct_outputs: Counter[torch.fx.Node] = Counter()
         output_index_dirty = True
 
         def changes_output_aliases(node, replacement):
@@ -370,9 +372,11 @@ def remove_no_ops(
                 output_roots.clear()
                 output_storages.clear()
                 output_pairs.clear()
+                direct_outputs.clear()
                 for result in graph.find_nodes(op="output"):
                     for leaf in pytree.tree_leaves(result.args):
                         if isinstance(leaf, torch.fx.Node):
+                            direct_outputs[leaf] += 1
                             root = alias_root(leaf)
                             storage = storages.get(leaf)
                             output_roots[root] += 1
@@ -453,11 +457,34 @@ def remove_no_ops(
                 else:
                     return
 
+            node_storage = storages.get(node)
+            direct_count = direct_outputs[node]
+            # Most returned identities are independent allocations. Update their
+            # output entries directly instead of rescanning all outputs per fold.
+            direct_only = (
+                not output_index_dirty
+                and node_storage is not None
+                and direct_count > 0
+                and output_roots[node] == direct_count
+                and output_storages[node_storage] == direct_count
+                and not any(alias_base(user) is node for user in node.users)
+            )
             node.replace_all_uses_with(replacement)
             replacement.meta.update(node.meta)
             graph.erase_node(node)
-            node_storage = storages.get(node)
-            if output_roots[node] or (
+            if direct_only:
+                replacement_root = alias_root(replacement)
+                replacement_storage = storages.get(replacement)
+                direct_outputs[node] -= direct_count
+                direct_outputs[replacement] += direct_count
+                output_roots[node] -= direct_count
+                output_roots[replacement_root] += direct_count
+                output_pairs[node, node_storage] -= direct_count
+                output_pairs[replacement_root, replacement_storage] += direct_count
+                output_storages[node_storage] -= direct_count
+                if replacement_storage is not None:
+                    output_storages[replacement_storage] += direct_count
+            elif output_roots[node] or (
                 node_storage is not None and output_storages[node_storage]
             ):
                 output_index_dirty = True
