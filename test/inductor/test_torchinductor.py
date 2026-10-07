@@ -23383,6 +23383,8 @@ class NoOpFoldingTests(InductorTestCase):
             "overlaps",
             "storage_id",
             "storage_address",
+            "data_address",
+            "opaque_alias_observer",
         ),
     )
     @parametrize("value_kind", ("direct", "view"))
@@ -23402,12 +23404,17 @@ class NoOpFoldingTests(InductorTestCase):
             observer = aten.is_set_to.default
         elif observer_kind == "is_alias_of":
             observer = torch._C._is_alias_of
-        elif observer_kind in ("storage_id", "storage_address"):
+        elif observer_kind == "opaque_alias_observer":
+
+            def observer(a, b):
+                return torch._C._is_alias_of(a, b)
+
+        elif observer_kind in ("storage_id", "storage_address", "data_address"):
             observer = getattr(torch._C, f"_{observer_kind}")
         else:
             observer = torch._C._overlaps
         with gm.graph.inserting_before(output):
-            if observer_kind in ("storage_id", "storage_address"):
+            if observer_kind in ("storage_id", "storage_address", "data_address"):
                 value_id = gm.graph.call_function(observer, args=(source,))
                 input_id = gm.graph.call_function(observer, args=(inp,))
                 result = gm.graph.call_function(operator.eq, args=(value_id, input_id))
@@ -23491,6 +23498,8 @@ class NoOpFoldingTests(InductorTestCase):
         self.check_tensor_observer(x, "_is_view", "direct", False)
 
     def test_noop_fold_preserves_tensor_impl_handle(self):
+        import ctypes
+
         def fn(x):
             return x * 1.0
 
@@ -23499,20 +23508,55 @@ class NoOpFoldingTests(InductorTestCase):
         inp = gm.graph.find_nodes(op="placeholder")[0]
         output = gm.graph.find_nodes(op="output")[0]
         with gm.graph.inserting_before(output):
-            handle = gm.graph.call_function(
+            output_handle = gm.graph.call_function(
                 torch._C._tensor_impl_raw_handle, args=(output.args[0],)
             )
-            wrapped = gm.graph.call_function(torch._C._wrap_tensor_impl, args=(handle,))
-            aliases_input = gm.graph.call_function(
-                torch._C._is_alias_of, args=(wrapped, inp)
+            input_handle = gm.graph.call_function(
+                torch._C._tensor_impl_raw_handle, args=(inp,)
             )
-        output.args = (aliases_input,)
+        output.args = ((output_handle, input_handle),)
         gm.graph.lint()
         gm.recompile()
 
-        self.assertFalse(gm(x))
+        capsule_pointer = ctypes.PYFUNCTYPE(
+            ctypes.c_void_p, ctypes.py_object, ctypes.c_char_p
+        )(("PyCapsule_GetPointer", ctypes.pythonapi))
+
+        def aliases_input():
+            output_capsule, input_capsule = gm(x)
+            return capsule_pointer(output_capsule, None) == capsule_pointer(
+                input_capsule, None
+            )
+
+        self.assertFalse(aliases_input())
         self.fold_and_check_mul(gm)
-        self.assertFalse(gm(x))
+        self.assertFalse(aliases_input())
+
+    @parametrize("bit_kind", ("conj", "neg"))
+    def test_noop_fold_preserves_native_bit_mutation(self, bit_kind):
+        def fn(x):
+            return x * 1.0
+
+        x = torch.ones(2, dtype=torch.complex64)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        output = gm.graph.find_nodes(op="output")[0]
+        value = output.args[0]
+        with gm.graph.inserting_before(output):
+            gm.graph.call_function(
+                getattr(torch._C, f"_set_{bit_kind}"), args=(value, True)
+            )
+        output.args = (gm.graph.find_nodes(op="placeholder")[0],)
+        gm.graph.lint()
+        gm.recompile()
+
+        def input_bit_changed():
+            value = x.clone()
+            gm(value)
+            return getattr(value, f"is_{bit_kind}")()
+
+        self.assertFalse(input_bit_changed())
+        self.fold_and_check_mul(gm)
+        self.assertFalse(input_bit_changed())
 
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_incremented_version_target(self, value_kind):

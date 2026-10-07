@@ -227,6 +227,9 @@ def remove_no_ops(
         # TensorImpl state, storage identity, and transfers are observable
         # through views, but not through an allocating operation. Follow only
         # view provenance to avoid retaining unrelated upstream allocations.
+        # Opaque calls lack a known value-only contract, so treat their tensor
+        # arguments as allocation-sensitive rather than enumerating every
+        # native or custom identity observer and mutator.
         allocation_sensitive_inputs: OrderedSet[torch.fx.Node] = OrderedSet()
         for current in graph.nodes:
             if current.target in (
@@ -239,17 +242,15 @@ def remove_no_ops(
                 aten.output_nr.default,
                 aten._version.default,
                 aten._has_same_storage_numel.default,
-                vars(torch._C)["_is_alias_of"],
-                vars(torch._C)["_overlaps"],
-                vars(torch._C)["_storage_id"],
-                vars(torch._C)["_storage_address"],
-                vars(torch._C)["_tensor_impl_raw_handle"],
-                vars(torch._C)["_increment_version"],
             ):
                 observed_inputs = current.all_input_nodes
-            elif current.op == "call_method" and current.target in (
-                "data_ptr",
-                "_is_view",
+            elif current.op == "call_method" or (
+                current.op == "call_function"
+                and current.target is not operator.getitem
+                and (
+                    not isinstance(current.target, torch._ops.OpOverload)
+                    or current.target.namespace not in ("aten", "prims")
+                )
             ):
                 observed_inputs = current.all_input_nodes
             elif current.target in (
