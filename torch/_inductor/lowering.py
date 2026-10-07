@@ -7742,12 +7742,12 @@ def _materialize_destination_backed_view(val, destination_names: Collection[str]
     src_data = val
     while isinstance(src_data, MutableBox):
         src_data = src_data.data
-    if isinstance(src_data, BaseView) and any(
-        name in val.get_read_names() for name in destination_names
-    ):
-        # A destination-backed view may read different indices than the mutation writes.
-        val = clone(val)
-        val.realize()
+    if isinstance(src_data, BaseView):
+        read_names = val.get_read_names()
+        if not read_names.isdisjoint(destination_names):
+            # A destination-backed view may read different indices than the mutation writes.
+            val = clone(val)
+            val.realize()
     return val
 
 
