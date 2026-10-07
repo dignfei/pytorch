@@ -206,6 +206,10 @@ def remove_no_ops(
         ):
             if any(not isinstance(t, torch.Tensor) for t in (t1, t2)):
                 return False
+            # Layout-specific metadata such as strides and storage offsets is
+            # unavailable on some sparse layouts. Preserve those allocations.
+            if t1.layout != t2.layout or t1.layout != torch.strided:
+                return False
             for field in fields:
                 v1 = (
                     getattr(t1, field)()
@@ -300,7 +304,7 @@ def remove_no_ops(
         # Opaque calls lack a known value-only contract, so treat their tensor
         # arguments as allocation-sensitive rather than enumerating every
         # native or custom identity observer and mutator.
-        allocation_sensitive_inputs: OrderedSet[torch.fx.Node] = OrderedSet()
+        allocation_sensitive_roots: OrderedSet[torch.fx.Node] = OrderedSet()
         for current in graph.nodes:
             if current.target in layout_observers:
                 observed_inputs = [first_tensor_input(current)]
@@ -343,14 +347,8 @@ def remove_no_ops(
             else:
                 continue
             for input_node in observed_inputs:
-                while (
-                    input_node is not None
-                    and input_node not in allocation_sensitive_inputs
-                ):
-                    allocation_sensitive_inputs.add(input_node)
-                    if (base := alias_base(input_node)) is None:
-                        break
-                    input_node = base
+                if isinstance(input_node, torch.fx.Node):
+                    allocation_sensitive_roots.add(alias_root(input_node))
 
         output_roots: Counter[torch.fx.Node] = Counter()
         output_storages: Counter[int] = Counter()
@@ -422,7 +420,7 @@ def remove_no_ops(
                 or is_mutated(node)
                 or changes_output_aliases(node, replacement)
                 or replacement in unresolved_bit_views
-                or node in allocation_sensitive_inputs
+                or alias_root(node) in allocation_sensitive_roots
             ):
                 return
 

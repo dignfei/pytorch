@@ -23066,6 +23066,33 @@ class NoOpFoldingTests(InductorTestCase):
         )
         gm.recompile()
 
+    def test_noop_fold_does_not_query_sparse_strides(self):
+        def fn(x):
+            return (x * 1.0).to_dense()
+
+        x = torch.sparse_csr_tensor(
+            torch.tensor([0, 1, 2]),
+            torch.tensor([0, 1]),
+            torch.tensor([1.0, 2.0]),
+            size=(2, 2),
+        )
+        # Proxy tracing CSR metadata queries its unsupported stride; use the
+        # equivalent real COO trace and the real CSR values for this pass.
+        coo = torch.sparse_coo_tensor(
+            torch.tensor([[0, 1], [0, 1]]), torch.tensor([1.0, 2.0]), (2, 2)
+        ).coalesce()
+        gm = make_fx(fn, tracing_mode="real")(coo)
+        gm.graph.find_nodes(op="placeholder")[0].meta["val"] = x
+        gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)[0].meta[
+            "val"
+        ] = x * 1.0
+        remove_no_ops(gm, OrderedSet(), OrderedSet())
+        gm.recompile()
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
+        )
+        self.assertEqual(gm(x), fn(x))
+
     def check_tensor_observer(self, x, observer, value_kind, expected):
         def fn(x):
             value = x * 1.0
