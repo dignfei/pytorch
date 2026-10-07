@@ -292,6 +292,8 @@ def remove_no_ops(
             aten._assert_tensor_metadata.default,
             aten.is_contiguous.default,
             aten.is_contiguous.memory_format,
+            aten.is_non_overlapping_and_dense.default,
+            aten.is_strides_like_format.default,
             aten.storage_offset.default,
             aten.stride.default,
             aten.stride.int,

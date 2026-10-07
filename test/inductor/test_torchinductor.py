@@ -23615,6 +23615,31 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(runtime_input))
 
+    def test_noop_fold_preserves_strides_like_format_observer(self):
+        trace_input = torch.ones((3, 2, 3, 4)).to(memory_format=torch.channels_last)
+        runtime_input = (
+            torch.ones((1, 2, 3, 4))
+            .to(memory_format=torch.channels_last)
+            .expand(3, -1, -1, -1)
+        )
+        gm = make_fx(lambda value: value * 1.0, tracing_mode="real")(trace_input)
+        mul = gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)[0]
+        output = gm.graph.find_nodes(op="output")[0]
+        with gm.graph.inserting_before(output):
+            observed = gm.graph.call_function(
+                aten.is_strides_like_format.default,
+                args=(mul, torch.channels_last),
+            )
+        output.args = (observed,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertFalse(
+            aten.is_strides_like_format.default(runtime_input, torch.channels_last)
+        )
+        self.assertTrue(gm(runtime_input))
+        self.fold_and_check_mul(gm)
+        self.assertTrue(gm(runtime_input))
+
     def test_noop_fold_preserves_native_bit_mutation(self):
         def fn(x):
             return x * 1.0
@@ -23696,6 +23721,7 @@ class NoOpFoldingTests(InductorTestCase):
             "contiguous_memory_format",
             "sym_contiguous",
             "internal_overlap",
+            "non_overlapping_and_dense",
             "assert_tensor_metadata",
         ),
     )
@@ -23704,6 +23730,7 @@ class NoOpFoldingTests(InductorTestCase):
             "stride" in observer_kind
             or "contiguous" in observer_kind
             or observer_kind == "internal_overlap"
+            or observer_kind == "non_overlapping_and_dense"
             or observer_kind == "assert_tensor_metadata"
         )
 
@@ -23721,7 +23748,7 @@ class NoOpFoldingTests(InductorTestCase):
         trace_input = base[:3].clone() if observes_runtime_layout else base.clone()
         runtime_input = (
             base[:1].expand(3)
-            if observer_kind == "internal_overlap"
+            if observer_kind in ("internal_overlap", "non_overlapping_and_dense")
             else base[::2]
             if observes_runtime_layout
             else base.clone()
@@ -23751,6 +23778,10 @@ class NoOpFoldingTests(InductorTestCase):
                     (torch.contiguous_format,),
                 ),
                 "internal_overlap": (aten._debug_has_internal_overlap.default, ()),
+                "non_overlapping_and_dense": (
+                    aten.is_non_overlapping_and_dense.default,
+                    (),
+                ),
                 "assert_tensor_metadata": (
                     aten._assert_tensor_metadata.default,
                     (None, [1], None),
