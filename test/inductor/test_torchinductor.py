@@ -23637,9 +23637,16 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertTrue(gm(runtime_input))
 
-    def test_noop_fold_preserves_view_as_complex_offset(self):
+    @parametrize("copy", (False, True))
+    def test_noop_fold_preserves_view_as_complex_offset(self, copy):
         def fn(x):
-            return torch.view_as_complex(x * 1.0) + 2
+            value = x * 1.0
+            view = (
+                aten.view_as_complex_copy.default(value)
+                if copy
+                else aten.view_as_complex.default(value)
+            )
+            return view + 2
 
         trace_input = torch.arange(4, dtype=torch.float).view(2, 2)
         runtime_input = torch.arange(5, dtype=torch.float)[1:].view(2, 2)

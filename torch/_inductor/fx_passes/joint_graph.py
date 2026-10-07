@@ -150,6 +150,17 @@ def remove_no_ops(
             for node in graph.find_nodes(op="call_function", target=target)
             if (index := identity_replacement_index(node)) is not None
         ]
+        if not candidates and not any(
+            isinstance(val := leaf.meta.get("val"), torch.Tensor)
+            and val.device.type == "meta"
+            for result in graph.find_nodes(op="output")
+            for leaf in pytree.tree_leaves(result.args)
+            if isinstance(leaf, torch.fx.Node)
+        ):
+            # The base pass also materializes returned meta tensors; leave that
+            # path below intact, but skip unused allocation indexes otherwise.
+            return
+
         mutated_storages = get_mutated_storages(gm)
         storages = {node: get_node_storage(node) for node in graph.nodes}
         external_storages = OrderedSet(
@@ -274,6 +285,7 @@ def remove_no_ops(
             aten.sym_stride.default,
             aten.sym_stride.int,
             aten.view_as_complex.default,
+            aten.view_as_complex_copy.default,
             aten.view.dtype,
             aten.view_copy.dtype,
         )
