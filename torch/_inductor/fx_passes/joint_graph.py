@@ -108,34 +108,6 @@ def remove_no_ops(
     with torch.utils._python_dispatch._disable_current_modes():
         graph = gm.graph
 
-        def rewrite_meta_outputs():
-            # Meta tensors have no data; rewrite them after any no-op folding.
-            for output_node in graph.find_nodes(op="output"):
-                had_meta_return = False
-
-                def visit(n):
-                    nonlocal had_meta_return
-                    val = n.meta.get("val")
-                    if isinstance(val, torch.Tensor) and val.device.type == "meta":
-                        with graph.inserting_before(output_node):
-                            # Materialize symbolic sizes/strides without
-                            # querying `n` and pinning it alive, which would
-                            # block eliminate_dead_code on the meta tensor.
-                            size = graph.materialize_symints(val.size())
-                            stride = graph.materialize_symints(val.stride())
-                            n.replace_all_uses_with(
-                                graph.call_function(
-                                    torch.ops.aten.empty_strided.default,
-                                    args=(size, stride),
-                                    kwargs={"dtype": val.dtype, "device": val.device},
-                                )
-                            )
-                        had_meta_return = True
-
-                torch.fx.map_arg(output_node.args, visit)
-                if had_meta_return:
-                    graph.eliminate_dead_code()
-
         def matches_identity(arg, known, scalar):
             return (isinstance(arg, torch.fx.Node) and arg in known) or (
                 isinstance(arg, (int, float)) and arg == scalar
@@ -301,6 +273,7 @@ def remove_no_ops(
             aten.sym_storage_offset.default,
             aten.sym_stride.default,
             aten.sym_stride.int,
+            aten.view_as_complex.default,
             aten.view.dtype,
             aten.view_copy.dtype,
         )
@@ -496,7 +469,35 @@ def remove_no_ops(
         for node, index in candidates:
             replace_no_op(node, index)
 
-        rewrite_meta_outputs()
+        # meta tensors returned from the graph have no data and can be replaced with empty_strided
+        for output_node in graph.find_nodes(op="output"):
+            had_meta_return = False
+
+            def visit(n):
+                nonlocal had_meta_return
+                val = n.meta.get("val")
+                if isinstance(val, torch.Tensor) and val.device.type == "meta":
+                    with graph.inserting_before(output_node):
+                        # size/stride may be symbolic under dynamic shapes;
+                        # materialize them so we never pass raw SymInts as args.
+                        # Use materialize_symints (roots backed sizes on input
+                        # placeholders) rather than create_size_node(n, d), which
+                        # would query `n` and pin it alive, blocking the
+                        # eliminate_dead_code() that removes this meta tensor.
+                        size = graph.materialize_symints(val.size())
+                        stride = graph.materialize_symints(val.stride())
+                        n.replace_all_uses_with(
+                            graph.call_function(
+                                torch.ops.aten.empty_strided.default,
+                                args=(size, stride),
+                                kwargs={"dtype": val.dtype, "device": val.device},
+                            )
+                        )
+                    had_meta_return = True
+
+            torch.fx.map_arg(output_node.args, visit)
+            if had_meta_return:
+                graph.eliminate_dead_code()
 
 
 def remove_redundant_views(gm: torch.fx.GraphModule):

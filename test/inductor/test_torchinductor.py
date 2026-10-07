@@ -23164,31 +23164,12 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
-    def test_noop_fold_preserves_data_view_observer(self):
+    @parametrize("view_kind", ("data", "lift"))
+    def test_noop_fold_preserves_storage_view_observer(self, view_kind):
+        view = aten.data.default if view_kind == "data" else aten.lift.default
+
         def fn(x):
-            return aten.data.default(aten.mul.Tensor(x, 1.0))
-
-        x = torch.ones(2)
-        gm = torch.fx.symbolic_trace(fn)
-        from torch.fx.passes.fake_tensor_prop import FakeTensorProp
-
-        FakeTensorProp(gm).propagate(x)
-        output = gm.graph.find_nodes(op="output")[0]
-        with gm.graph.inserting_before(output):
-            observed = gm.graph.call_function(
-                aten.is_set_to.default,
-                args=(output.args[0], gm.graph.find_nodes(op="placeholder")[0]),
-            )
-        output.args = (observed,)
-        gm.graph.lint()
-        gm.recompile()
-        self.assertFalse(gm(x))
-        self.fold_and_check_mul(gm)
-        self.assertFalse(gm(x))
-
-    def test_noop_fold_preserves_lifted_storage_observer(self):
-        def fn(x):
-            return aten.lift.default(aten.mul.Tensor(x, 1.0))
+            return view(aten.mul.Tensor(x, 1.0))
 
         x = torch.ones(2)
         gm = torch.fx.symbolic_trace(fn)
@@ -23655,6 +23636,19 @@ class NoOpFoldingTests(InductorTestCase):
         self.assertTrue(gm(runtime_input))
         self.fold_and_check_mul(gm)
         self.assertTrue(gm(runtime_input))
+
+    def test_noop_fold_preserves_view_as_complex_offset(self):
+        def fn(x):
+            return torch.view_as_complex(x * 1.0) + 2
+
+        trace_input = torch.arange(4, dtype=torch.float).view(2, 2)
+        runtime_input = torch.arange(5, dtype=torch.float)[1:].view(2, 2)
+        self.assertEqual(runtime_input.storage_offset(), 1)
+        gm = make_fx(fn, tracing_mode="real")(trace_input)
+        expected = fn(runtime_input)
+        self.assertEqual(gm(runtime_input), expected)
+        self.fold_and_check_mul(gm)
+        self.assertEqual(gm(runtime_input), expected)
 
     def test_noop_fold_preserves_native_bit_mutation(self):
         def fn(x):
