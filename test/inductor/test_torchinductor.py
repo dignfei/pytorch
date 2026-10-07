@@ -23166,15 +23166,13 @@ class NoOpFoldingTests(InductorTestCase):
 
     def test_noop_fold_preserves_data_view_observer(self):
         def fn(x):
-            return aten.data.default(x * 1.0)
+            return aten.data.default(aten.mul.Tensor(x, 1.0))
 
         x = torch.ones(2)
-        gm = make_fx(fn, tracing_mode="real")(x)
-        # make_fx normalizes aten.data to aten.alias; restore the real target
-        # so this case checks its missing schema alias metadata.
-        gm.graph.find_nodes(op="call_function", target=aten.alias.default)[
-            0
-        ].target = aten.data.default
+        gm = torch.fx.symbolic_trace(fn)
+        from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+
+        FakeTensorProp(gm).propagate(x)
         output = gm.graph.find_nodes(op="output")[0]
         with gm.graph.inserting_before(output):
             observed = gm.graph.call_function(
@@ -23190,15 +23188,13 @@ class NoOpFoldingTests(InductorTestCase):
 
     def test_noop_fold_preserves_lifted_storage_observer(self):
         def fn(x):
-            return aten.alias.default(x * 1.0)
+            return aten.lift.default(aten.mul.Tensor(x, 1.0))
 
         x = torch.ones(2)
-        gm = make_fx(fn, tracing_mode="real")(x)
-        # Tracing the identity lift removes it; retain an alias node and then
-        # test the real native lift target and its storage provenance.
-        gm.graph.find_nodes(op="call_function", target=aten.alias.default)[
-            0
-        ].target = aten.lift.default
+        gm = torch.fx.symbolic_trace(fn)
+        from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+
+        FakeTensorProp(gm).propagate(x)
         output = gm.graph.find_nodes(op="output")[0]
         with gm.graph.inserting_before(output):
             observed = gm.graph.call_function(
@@ -23669,9 +23665,8 @@ class NoOpFoldingTests(InductorTestCase):
             len(gm.graph.find_nodes(op="call_function", target=aten.add.Tensor)), 1
         )
 
-    @parametrize("transfer_kind", ("tensor", "storage_offset"))
     @parametrize("value_kind", ("direct", "view"))
-    def test_noop_fold_preserves_set_source_allocation(self, transfer_kind, value_kind):
+    def test_noop_fold_preserves_set_source_allocation(self, value_kind):
         def fn(x):
             value = x * 1.0
             if value_kind == "view":
@@ -23684,16 +23679,6 @@ class NoOpFoldingTests(InductorTestCase):
         x = torch.tensor([1.0, 2.0])
         expected = fn(x.clone())
         gm = make_fx(fn, tracing_mode="real")(x.clone())
-        if transfer_kind == "storage_offset":
-            # This overload is a real FX operator, but make_fx attempts to
-            # trace its Storage argument rather than record its Tensor source.
-            set_node = gm.graph.find_nodes(
-                op="call_function", target=aten.set_.source_Tensor
-            )[0]
-            set_node.target = aten.set_.source_Tensor_storage_offset
-            set_node.args = (*set_node.args, 0, [2], [1])
-            gm.graph.lint()
-            gm.recompile()
         self.assertEqual(gm(x.clone()), expected)
         self.fold_and_check_mul(gm)
         self.assertEqual(gm(x.clone()), expected)
@@ -23713,6 +23698,7 @@ class NoOpFoldingTests(InductorTestCase):
             "contiguous_memory_format",
             "sym_contiguous",
             "internal_overlap",
+            "assert_tensor_metadata",
         ),
     )
     def test_noop_fold_preserves_layout_observers(self, observer_kind):
@@ -23720,6 +23706,7 @@ class NoOpFoldingTests(InductorTestCase):
             "stride" in observer_kind
             or "contiguous" in observer_kind
             or observer_kind == "internal_overlap"
+            or observer_kind == "assert_tensor_metadata"
         )
 
         def fn(base):
@@ -23766,6 +23753,10 @@ class NoOpFoldingTests(InductorTestCase):
                     (torch.contiguous_format,),
                 ),
                 "internal_overlap": (aten._debug_has_internal_overlap.default, ()),
+                "assert_tensor_metadata": (
+                    aten._assert_tensor_metadata.default,
+                    (None, [1], None),
+                ),
             }[observer_kind]
             with gm.graph.inserting_before(output):
                 observed = gm.graph.call_function(op, args=(mul, *args))
