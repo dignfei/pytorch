@@ -293,8 +293,15 @@ def remove_no_ops(
             aten.as_strided.default,
             aten.as_strided_copy.default,
             aten.as_strided_scatter.default,
+            aten.is_contiguous.default,
+            aten.is_contiguous.memory_format,
             aten.storage_offset.default,
+            aten.stride.default,
+            aten.stride.int,
+            aten.sym_is_contiguous.default,
             aten.sym_storage_offset.default,
+            aten.sym_stride.default,
+            aten.sym_stride.int,
             aten.view.dtype,
             aten.view_copy.dtype,
         )
@@ -335,6 +342,7 @@ def remove_no_ops(
                 aten.set_.source_Tensor,
                 aten.set_.source_Tensor_storage_offset,
                 aten.set_data.default,
+                aten.shallow_copy_data_.default,
             ):
                 observed_inputs = [
                     value

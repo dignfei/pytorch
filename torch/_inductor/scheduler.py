@@ -9701,23 +9701,30 @@ class Scheduler:
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         candidate_nodes = (node1, node2)
-        candidate_leaves = tuple(
-            leaf for node in candidate_nodes for leaf in node.get_nodes()
-        )
-        for mutating_node in candidate_leaves:
-            for weak_dep in mutating_node._pruned_weak_deps:
-                reading_node = next(
-                    (
-                        leaf
-                        for leaf in candidate_leaves
-                        if weak_dep.name in leaf.get_buffer_names()
-                    ),
-                    None,
-                )
-                if reading_node is not None and not self.fusable_weak_dep(
-                    weak_dep, reading_node, mutating_node
-                ):
-                    return False
+        candidate_leaves = tuple(tuple(node.get_nodes()) for node in candidate_nodes)
+        for mutation_leaves in candidate_leaves:
+            for mutating_node in mutation_leaves:
+                for weak_dep in mutating_node._pruned_weak_deps:
+                    reading_candidate = next(
+                        (
+                            (node, leaves)
+                            for node, leaves in zip(
+                                candidate_nodes, candidate_leaves, strict=True
+                            )
+                            if any(
+                                weak_dep.name in leaf.get_buffer_names()
+                                for leaf in leaves
+                            )
+                        ),
+                        None,
+                    )
+                    if reading_candidate is not None and not self.fusable_weak_dep(
+                        weak_dep,
+                        reading_candidate[0],
+                        mutating_node,
+                        reading_nodes=reading_candidate[1],
+                    ):
+                        return False
         return True
 
     def shared_data_after_reordering_loop(
@@ -10990,7 +10997,12 @@ class Scheduler:
         return True
 
     def fusable_weak_dep(
-        self, weak_dep: WeakDep, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+        self,
+        weak_dep: WeakDep,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        *,
+        reading_nodes: Sequence[BaseSchedulerNode] | None = None,
     ) -> bool:
         if weak_dep.name not in node1.get_buffer_names():
             return False
@@ -11020,9 +11032,9 @@ class Scheduler:
             return False
 
         real_name = self.mutation_real_name[weak_dep.mutating_buf]
-        relevant_reading_nodes = [node1]
-        if isinstance(node1, ForeachKernelSchedulerNode):
-            relevant_reading_nodes = node1.snodes
+        relevant_reading_nodes = (
+            node1.get_nodes() if reading_nodes is None else reading_nodes
+        )
         num_concurrent_reads = 0
         for reading_node in relevant_reading_nodes:
             # A read of an earlier mutation of the same buffer (the output of an

@@ -23136,7 +23136,8 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
-    def test_noop_fold_preserves_set_data_source_allocation(self):
+    @parametrize("transfer_kind", ("set_data", "shallow_copy_data"))
+    def test_noop_fold_preserves_data_transfer_source_allocation(self, transfer_kind):
         def fn(x):
             value = x * 1.0
             return torch.empty(0), value
@@ -23146,7 +23147,12 @@ class NoOpFoldingTests(InductorTestCase):
         output = gm.graph.find_nodes(op="output")[0]
         destination, value = output.args[0]
         with gm.graph.inserting_before(output):
-            gm.graph.call_function(aten.set_data.default, args=(destination, value))
+            transfer = (
+                aten.set_data.default
+                if transfer_kind == "set_data"
+                else aten.shallow_copy_data_.default
+            )
+            gm.graph.call_function(transfer, args=(destination, value))
             observed = gm.graph.call_function(
                 torch._C._is_alias_of,
                 args=(destination, gm.graph.find_nodes(op="placeholder")[0]),
@@ -23692,10 +23698,29 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertEqual(gm(x.clone()), expected)
 
-    @parametrize("observer_kind", ("offset", "sym_offset", "scatter", "copy"))
+    @parametrize(
+        "observer_kind",
+        (
+            "offset",
+            "sym_offset",
+            "scatter",
+            "copy",
+            "stride",
+            "strides",
+            "sym_stride",
+            "sym_strides",
+            "contiguous",
+            "contiguous_memory_format",
+            "sym_contiguous",
+        ),
+    )
     def test_noop_fold_preserves_layout_observers(self, observer_kind):
+        observes_runtime_layout = (
+            "stride" in observer_kind or "contiguous" in observer_kind
+        )
+
         def fn(base):
-            value = base[1:5] * 1.0
+            value = base * 1.0 if observes_runtime_layout else base[1:5] * 1.0
             if observer_kind == "scatter":
                 return aten.as_strided_scatter.default(
                     value, torch.tensor([99.0]), [1], [1], 0
@@ -23705,27 +23730,47 @@ class NoOpFoldingTests(InductorTestCase):
             return (value,)
 
         base = torch.tensor([11.0, 22.0, 33.0, 44.0, 55.0, 66.0])
-        gm = make_fx(fn, tracing_mode="real")(base.clone())
+        trace_input = base[:3].clone() if observes_runtime_layout else base.clone()
+        runtime_input = base[::2] if observes_runtime_layout else base.clone()
+        gm = make_fx(fn, tracing_mode="real")(trace_input)
         if observer_kind in ("scatter", "copy"):
-            expected = fn(base.clone())
+            expected = fn(runtime_input)
         else:
-            # make_fx constant-folds storage_offset; preserve its real FX op.
+            # make_fx constant-folds metadata observers; preserve real FX ops
+            # and replay contiguous traces with noncontiguous runtime inputs.
             mul = gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)[0]
             output = gm.graph.find_nodes(op="output")[0]
-            op = (
-                aten.storage_offset.default
-                if observer_kind == "offset"
-                else aten.sym_storage_offset.default
-            )
+            op, args = {
+                "offset": (aten.storage_offset.default, ()),
+                "sym_offset": (aten.sym_storage_offset.default, ()),
+                "stride": (aten.stride.int, (0,)),
+                "strides": (aten.stride.default, ()),
+                "sym_stride": (aten.sym_stride.int, (0,)),
+                "sym_strides": (aten.sym_stride.default, ()),
+                "contiguous": (aten.is_contiguous.default, ()),
+                "contiguous_memory_format": (
+                    aten.is_contiguous.memory_format,
+                    (torch.contiguous_format,),
+                ),
+                "sym_contiguous": (
+                    aten.sym_is_contiguous.default,
+                    (torch.contiguous_format,),
+                ),
+            }[observer_kind]
             with gm.graph.inserting_before(output):
-                offset = gm.graph.call_function(op, args=(mul,))
-            output.args = (offset,)
+                observed = gm.graph.call_function(op, args=(mul, *args))
+            output.args = (observed,)
             gm.graph.lint()
             gm.recompile()
-            expected = op(base[1:5] * 1.0)
-        self.assertEqual(gm(base.clone()), expected)
+            expected = op(
+                runtime_input * 1.0
+                if observes_runtime_layout
+                else runtime_input[1:5] * 1.0,
+                *args,
+            )
+        self.assertEqual(gm(runtime_input), expected)
         self.fold_and_check_mul(gm)
-        self.assertEqual(gm(base.clone()), expected)
+        self.assertEqual(gm(runtime_input), expected)
 
     @parametrize("view_kind", ("conj", "neg"))
     def test_noop_fold_preserves_unresolved_view_bits(self, view_kind):

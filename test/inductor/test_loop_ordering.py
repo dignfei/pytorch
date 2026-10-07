@@ -791,11 +791,17 @@ class LoopOrderingTest(TestCase):
             return x + 1.0
 
         def check_fused_node(nodes):
-            self.assertEqual(len(nodes), 1)
-            self.assertIsInstance(nodes[0], FusedSchedulerNode)
-            self.assertEqual(len(nodes[0].get_nodes()), 3)
+            # The final reader of x cannot join the fused mutating group:
+            # it must observe the copy only after that mutation finishes.
+            self.assertEqual(len(nodes), 2)
+            self.assertTrue(any(isinstance(node, FusedSchedulerNode) for node in nodes))
             self.assertEqual(
-                sum(len(leaf._pruned_weak_deps) for leaf in nodes[0].get_nodes()), 1
+                sum(
+                    len(leaf._pruned_weak_deps)
+                    for node in nodes
+                    for leaf in node.get_nodes()
+                ),
+                1,
             )
             return nodes
 
@@ -804,7 +810,31 @@ class LoopOrderingTest(TestCase):
         with inductor_config.patch(_post_fusion_custom_pass=check_fused_node):
             actual = torch.compile(f)(x.clone())
         self.assertEqual(actual, expected)
-        self.assertEqual(metrics.generated_kernel_count, 1)
+        self.assertEqual(metrics.generated_kernel_count, 2)
+
+    def test_pruned_weak_dep_checks_fused_reading_siblings(self):
+        def f(x):
+            producer = realize(x * 2.0)
+            sibling = realize(torch.roll(x, 1) + 3.0)
+            x.copy_(producer)
+            return x, sibling
+
+        def inspect(nodes):
+            scheduler = nodes[0].scheduler
+            scheduler.prune_redundant_deps(nodes)
+            self.assertEqual(len(nodes), 4)
+            fused_reader = FusedSchedulerNode.fuse(nodes[0], nodes[1])
+            self.assertEqual(len(nodes[3]._pruned_weak_deps), 1)
+            self.assertFalse(
+                scheduler._pruned_weak_deps_still_fusable(fused_reader, nodes[3])
+            )
+            return nodes
+
+        x = torch.rand(1024, device=self.device)
+        expected = f(x.clone())
+        with inductor_config.patch(_pre_fusion_custom_pass=inspect):
+            actual = torch.compile(f)(x.clone())
+        self.assertEqual(actual, expected)
 
     def test_different_broadcast_shapes(self):
         def f(x, y, c):
