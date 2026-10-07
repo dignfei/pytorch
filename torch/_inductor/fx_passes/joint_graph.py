@@ -109,8 +109,7 @@ def remove_no_ops(
         graph = gm.graph
 
         def rewrite_meta_outputs():
-            # Meta tensors have no data; keep this rewrite even when there is
-            # no arithmetic identity candidate in the graph.
+            # Meta tensors have no data; rewrite them after any no-op folding.
             for output_node in graph.find_nodes(op="output"):
                 had_meta_return = False
 
@@ -179,10 +178,6 @@ def remove_no_ops(
             for node in graph.find_nodes(op="call_function", target=target)
             if (index := identity_replacement_index(node)) is not None
         ]
-        if not candidates:
-            rewrite_meta_outputs()
-            return
-
         mutated_storages = get_mutated_storages(gm)
         storages = {node: get_node_storage(node) for node in graph.nodes}
         external_storages = OrderedSet(
@@ -320,6 +315,8 @@ def remove_no_ops(
             elif current.target in (
                 aten.is_set_to.default,
                 aten.is_pinned.default,
+                aten.is_conj.default,
+                aten.is_neg.default,
                 aten.is_inference.default,
                 aten.is_leaf.default,
                 aten._is_zerotensor.default,

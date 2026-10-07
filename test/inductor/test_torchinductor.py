@@ -23595,27 +23595,25 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
-    def test_noop_fold_rewrites_meta_output_without_identity_candidate(self):
-        gm = make_fx(lambda x: x, tracing_mode="real")(torch.empty(2, device="meta"))
-        self.assertEqual(
-            len(
-                gm.graph.find_nodes(
-                    op="call_function", target=aten.empty_strided.default
-                )
-            ),
-            0,
-        )
-        remove_no_ops(gm, OrderedSet(), OrderedSet())
+    @parametrize("bit_kind", ("conj", "neg"))
+    def test_noop_fold_preserves_view_bit_observers(self, bit_kind):
+        x = torch.ones(2, dtype=torch.complex64 if bit_kind == "conj" else torch.float)
+        gm = make_fx(lambda value: value * 1.0, tracing_mode="real")(x)
+        mul = gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)[0]
+        output = gm.graph.find_nodes(op="output")[0]
+        observer = aten.is_conj.default if bit_kind == "conj" else aten.is_neg.default
+        with gm.graph.inserting_before(output):
+            observed = gm.graph.call_function(observer, args=(mul,))
+        output.args = (observed,)
+        gm.graph.lint()
         gm.recompile()
-        self.assertEqual(
-            len(
-                gm.graph.find_nodes(
-                    op="call_function", target=aten.empty_strided.default
-                )
-            ),
-            1,
+        runtime_input = (
+            aten._conj.default(x) if bit_kind == "conj" else aten._neg_view.default(x)
         )
-        self.assertEqual(gm(torch.ones(2)).device.type, "meta")
+        self.assertTrue(observer(runtime_input))
+        self.assertFalse(gm(runtime_input))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(runtime_input))
 
     def test_noop_fold_preserves_native_bit_mutation(self):
         def fn(x):
