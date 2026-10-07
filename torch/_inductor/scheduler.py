@@ -9722,7 +9722,6 @@ class Scheduler:
                         weak_dep,
                         reading_candidate[0],
                         mutating_node,
-                        reading_nodes=reading_candidate[1],
                     ):
                         return False
         return True
@@ -11001,8 +11000,6 @@ class Scheduler:
         weak_dep: WeakDep,
         node1: BaseSchedulerNode,
         node2: BaseSchedulerNode,
-        *,
-        reading_nodes: Sequence[BaseSchedulerNode] | None = None,
     ) -> bool:
         if weak_dep.name not in node1.get_buffer_names():
             return False
@@ -11032,11 +11029,8 @@ class Scheduler:
             return False
 
         real_name = self.mutation_real_name[weak_dep.mutating_buf]
-        relevant_reading_nodes = (
-            node1.get_nodes() if reading_nodes is None else reading_nodes
-        )
         num_concurrent_reads = 0
-        for reading_node in relevant_reading_nodes:
+        for reading_node in node1.get_nodes():
             # A read of an earlier mutation of the same buffer (the output of an
             # index_put_ into it, say) reads the same memory under another name.
             relevant_reads = [

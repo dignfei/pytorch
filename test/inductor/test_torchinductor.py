@@ -23208,6 +23208,22 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertFalse(gm(x))
 
+    def test_noop_fold_preserves_new_zeros_feature_storage_capacity(self):
+        def fn(x):
+            value = aten.mul.Tensor(x, 1.0)
+            result = aten._new_zeros_with_same_feature_meta.default(x, value)
+            return aten._has_same_storage_numel.default(result, x)
+
+        base = torch.arange(6, dtype=torch.float)
+        runtime_input = base[:2]
+        gm = torch.fx.symbolic_trace(fn)
+        from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+
+        FakeTensorProp(gm).propagate(torch.ones(2))
+        self.assertFalse(gm(runtime_input))
+        self.fold_and_check_mul(gm)
+        self.assertFalse(gm(runtime_input))
+
     @parametrize("mutation_kind", ("view", "out_keyword"))
     def test_noop_source_retained_through_alias_mutation(self, mutation_kind):
         def fn(x, y):

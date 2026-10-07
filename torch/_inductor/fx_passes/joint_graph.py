@@ -353,6 +353,16 @@ def remove_no_ops(
                     if schema_arg.name in ("source", "new_data")
                     and isinstance(value, torch.fx.Node)
                 ]
+            elif current.target is aten._new_zeros_with_same_feature_meta.default:
+                # This allocation inherits the *storage capacity* of other,
+                # not only its visible shape and strides.
+                observed_inputs = [
+                    value
+                    for schema_arg, value in zip_schema(
+                        current.target._schema, current.args, current.kwargs
+                    )
+                    if schema_arg.name == "other" and isinstance(value, torch.fx.Node)
+                ]
             else:
                 continue
             for input_node in observed_inputs:
