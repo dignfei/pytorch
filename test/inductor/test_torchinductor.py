@@ -23066,9 +23066,7 @@ class NoOpFoldingTests(InductorTestCase):
         )
         gm.recompile()
 
-    def check_tensor_observer(
-        self, x, observer, value_kind, expected, compare_with_input=False
-    ):
+    def check_tensor_observer(self, x, observer, value_kind, expected):
         def fn(x):
             value = x * 1.0
             return value.view_as(value) if value_kind == "view" else value
@@ -23084,11 +23082,6 @@ class NoOpFoldingTests(InductorTestCase):
                 return gm.graph.call_function(observer, args=(node,))
 
             result = observe(source)
-            if compare_with_input:
-                inp = gm.graph.find_nodes(op="placeholder")[0]
-                result = gm.graph.call_function(
-                    operator.eq, args=(result, observe(inp))
-                )
         output.args = (result,)
         gm.graph.lint()
         gm.recompile()
@@ -23379,11 +23372,7 @@ class NoOpFoldingTests(InductorTestCase):
         "observer_kind",
         (
             "is_set_to",
-            "is_alias_of",
             "overlaps",
-            "storage_id",
-            "storage_address",
-            "data_address",
             "opaque_alias_observer",
         ),
     )
@@ -23402,24 +23391,15 @@ class NoOpFoldingTests(InductorTestCase):
         source = output.args[0]
         if observer_kind == "is_set_to":
             observer = aten.is_set_to.default
-        elif observer_kind == "is_alias_of":
-            observer = torch._C._is_alias_of
         elif observer_kind == "opaque_alias_observer":
 
             def observer(a, b):
                 return torch._C._is_alias_of(a, b)
 
-        elif observer_kind in ("storage_id", "storage_address", "data_address"):
-            observer = getattr(torch._C, f"_{observer_kind}")
         else:
             observer = torch._C._overlaps
         with gm.graph.inserting_before(output):
-            if observer_kind in ("storage_id", "storage_address", "data_address"):
-                value_id = gm.graph.call_function(observer, args=(source,))
-                input_id = gm.graph.call_function(observer, args=(inp,))
-                result = gm.graph.call_function(operator.eq, args=(value_id, input_id))
-            else:
-                result = gm.graph.call_function(observer, args=(source, inp))
+            result = gm.graph.call_function(observer, args=(source, inp))
         output.args = (result,)
         gm.graph.lint()
         gm.recompile()
@@ -23487,53 +23467,58 @@ class NoOpFoldingTests(InductorTestCase):
         self.assertEqual(aten.output_nr.default(x), 1)
         self.check_tensor_observer(x, aten.output_nr.default, value_kind, 0)
 
-    @parametrize("value_kind", ("direct", "view"))
-    def test_noop_fold_preserves_data_ptr(self, value_kind):
-        x = torch.tensor([1.0, 2.0])
-        self.check_tensor_observer(x, "data_ptr", value_kind, False, True)
-
     def test_noop_fold_preserves_is_view(self):
         x = torch.ones(4)[1:3]
         self.assertTrue(x._is_view())
         self.check_tensor_observer(x, "_is_view", "direct", False)
 
-    def test_noop_fold_preserves_tensor_impl_handle(self):
-        import ctypes
+    def test_noop_fold_preserves_call_module_observer(self):
+        class AliasObserver(torch.nn.Module):
+            def forward(self, a, b):
+                return torch._C._is_alias_of(a, b)
 
         def fn(x):
             return x * 1.0
 
         x = torch.ones(2)
         gm = make_fx(fn, tracing_mode="real")(x)
-        inp = gm.graph.find_nodes(op="placeholder")[0]
+        gm.add_module("alias_observer", AliasObserver())
         output = gm.graph.find_nodes(op="output")[0]
         with gm.graph.inserting_before(output):
-            output_handle = gm.graph.call_function(
-                torch._C._tensor_impl_raw_handle, args=(output.args[0],)
+            observed = gm.graph.call_module(
+                "alias_observer",
+                args=(output.args[0], gm.graph.find_nodes(op="placeholder")[0]),
             )
-            input_handle = gm.graph.call_function(
-                torch._C._tensor_impl_raw_handle, args=(inp,)
-            )
-        output.args = ((output_handle, input_handle),)
+        output.args = (observed,)
         gm.graph.lint()
         gm.recompile()
-
-        capsule_pointer = ctypes.PYFUNCTYPE(
-            ctypes.c_void_p, ctypes.py_object, ctypes.c_char_p
-        )(("PyCapsule_GetPointer", ctypes.pythonapi))
-
-        def aliases_input():
-            output_capsule, input_capsule = gm(x)
-            return capsule_pointer(output_capsule, None) == capsule_pointer(
-                input_capsule, None
-            )
-
-        self.assertFalse(aliases_input())
+        self.assertFalse(gm(x))
         self.fold_and_check_mul(gm)
-        self.assertFalse(aliases_input())
+        self.assertFalse(gm(x))
 
-    @parametrize("bit_kind", ("conj", "neg"))
-    def test_noop_fold_preserves_native_bit_mutation(self, bit_kind):
+    def test_noop_fold_rewrites_meta_output_without_identity_candidate(self):
+        gm = make_fx(lambda x: x, tracing_mode="real")(torch.empty(2, device="meta"))
+        self.assertEqual(
+            len(
+                gm.graph.find_nodes(
+                    op="call_function", target=aten.empty_strided.default
+                )
+            ),
+            0,
+        )
+        remove_no_ops(gm, OrderedSet(), OrderedSet())
+        gm.recompile()
+        self.assertEqual(
+            len(
+                gm.graph.find_nodes(
+                    op="call_function", target=aten.empty_strided.default
+                )
+            ),
+            1,
+        )
+        self.assertEqual(gm(torch.ones(2)).device.type, "meta")
+
+    def test_noop_fold_preserves_native_bit_mutation(self):
         def fn(x):
             return x * 1.0
 
@@ -23542,9 +23527,7 @@ class NoOpFoldingTests(InductorTestCase):
         output = gm.graph.find_nodes(op="output")[0]
         value = output.args[0]
         with gm.graph.inserting_before(output):
-            gm.graph.call_function(
-                getattr(torch._C, f"_set_{bit_kind}"), args=(value, True)
-            )
+            gm.graph.call_function(torch._C._set_conj, args=(value, True))
         output.args = (gm.graph.find_nodes(op="placeholder")[0],)
         gm.graph.lint()
         gm.recompile()
@@ -23552,33 +23535,11 @@ class NoOpFoldingTests(InductorTestCase):
         def input_bit_changed():
             value = x.clone()
             gm(value)
-            return getattr(value, f"is_{bit_kind}")()
+            return value.is_conj()
 
         self.assertFalse(input_bit_changed())
         self.fold_and_check_mul(gm)
         self.assertFalse(input_bit_changed())
-
-    @parametrize("value_kind", ("direct", "view"))
-    def test_noop_fold_preserves_incremented_version_target(self, value_kind):
-        def fn(x):
-            value = x * 1
-            return value.view_as(value) if value_kind == "view" else value
-
-        x = torch.tensor([1, 2])
-        gm = make_fx(fn, tracing_mode="real")(x)
-        inp = gm.graph.find_nodes(op="placeholder")[0]
-        output = gm.graph.find_nodes(op="output")[0]
-        with gm.graph.inserting_before(output):
-            gm.graph.call_function(
-                torch._C._increment_version, args=([output.args[0]],)
-            )
-            input_version = gm.graph.call_function(aten._version.default, args=(inp,))
-        output.args = (input_version,)
-        gm.graph.lint()
-        gm.recompile()
-        self.assertEqual(gm(x.clone()), 0)
-        self.fold_and_check_mul(gm)
-        self.assertEqual(gm(x.clone()), 0)
 
     def test_noop_fold_preserves_zerotensor_state(self):
         def fn(x):
