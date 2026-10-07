@@ -23062,6 +23062,36 @@ class NoOpFoldingTests(InductorTestCase):
         )
         gm.recompile()
 
+    def check_tensor_observer(
+        self, x, observer, value_kind, expected, compare_with_input=False
+    ):
+        def fn(x):
+            value = x * 1.0
+            return value.view_as(value) if value_kind == "view" else value
+
+        gm = make_fx(fn, tracing_mode="real")(x)
+        output = gm.graph.find_nodes(op="output")[0]
+        source = output.args[0]
+        with gm.graph.inserting_before(output):
+
+            def observe(node):
+                if isinstance(observer, str):
+                    return gm.graph.call_method(observer, args=(node,))
+                return gm.graph.call_function(observer, args=(node,))
+
+            result = observe(source)
+            if compare_with_input:
+                inp = gm.graph.find_nodes(op="placeholder")[0]
+                result = gm.graph.call_function(
+                    operator.eq, args=(result, observe(inp))
+                )
+        output.args = (result,)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertEqual(gm(x), expected)
+        self.fold_and_check_mul(gm)
+        self.assertEqual(gm(x), expected)
+
     def test_noop_fold_preserves_functional_set_source_allocation(self):
         def fn(x):
             value = x * 1
@@ -23407,126 +23437,65 @@ class NoOpFoldingTests(InductorTestCase):
     @requires_cuda
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_pinned_storage(self, value_kind):
-        def fn(x):
-            value = x * 1.0
-            return value.view_as(value) if value_kind == "view" else value
-
         x = torch.empty(2, pin_memory=True)
         x.fill_(1.0)
-        gm = make_fx(fn, tracing_mode="real")(x)
-        output = gm.graph.find_nodes(op="output")[0]
-        with gm.graph.inserting_before(output):
-            pinned = gm.graph.call_function(
-                aten.is_pinned.default, args=(output.args[0],)
-            )
-        output.args = (pinned,)
-        gm.graph.lint()
-        gm.recompile()
-        self.assertFalse(gm(x))
-        self.fold_and_check_mul(gm)
-        self.assertFalse(gm(x))
+        self.check_tensor_observer(x, aten.is_pinned.default, value_kind, False)
 
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_inference_storage(self, value_kind):
-        def fn(x):
-            value = x * 1.0
-            return value.view_as(value) if value_kind == "view" else value
-
         with torch.inference_mode():
             x = torch.ones(2)
-        gm = make_fx(fn, tracing_mode="real")(x)
-        output = gm.graph.find_nodes(op="output")[0]
-        with gm.graph.inserting_before(output):
-            inference = gm.graph.call_function(
-                aten.is_inference.default, args=(output.args[0],)
-            )
-        output.args = (inference,)
-        gm.graph.lint()
-        gm.recompile()
-        self.assertFalse(gm(x))
-        self.fold_and_check_mul(gm)
-        self.assertFalse(gm(x))
+        self.check_tensor_observer(x, aten.is_inference.default, value_kind, False)
 
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_tensor_version(self, value_kind):
-        def fn(x):
-            value = x * 1.0
-            return value.view_as(value) if value_kind == "view" else value
-
         x = torch.ones(2)
         x.add_(1)
-        gm = make_fx(fn, tracing_mode="real")(x)
-        output = gm.graph.find_nodes(op="output")[0]
-        with gm.graph.inserting_before(output):
-            version = gm.graph.call_function(
-                aten._version.default, args=(output.args[0],)
-            )
-        output.args = (version,)
-        gm.graph.lint()
-        gm.recompile()
-        self.assertEqual(gm(x), 0)
-        self.fold_and_check_mul(gm)
-        self.assertEqual(gm(x), 0)
+        self.check_tensor_observer(x, aten._version.default, value_kind, 0)
 
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_leaf_state(self, value_kind):
-        def fn(x):
-            value = x * 1.0
-            return value.view_as(value) if value_kind == "view" else value
-
         x = torch.ones(2, requires_grad=True)
-        gm = make_fx(fn, tracing_mode="real")(x)
-        output = gm.graph.find_nodes(op="output")[0]
-        with gm.graph.inserting_before(output):
-            leaf = gm.graph.call_function(aten.is_leaf.default, args=(output.args[0],))
-        output.args = (leaf,)
-        gm.graph.lint()
-        gm.recompile()
-        self.assertFalse(gm(x))
-        self.fold_and_check_mul(gm)
-        self.assertFalse(gm(x))
+        self.check_tensor_observer(x, aten.is_leaf.default, value_kind, False)
 
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_retained_grad_state(self, value_kind):
-        def fn(x):
-            value = x * 1.0
-            return value.view_as(value) if value_kind == "view" else value
-
         x = torch.ones(2, requires_grad=True) * 2
         x.retain_grad()
-        gm = make_fx(fn, tracing_mode="real")(x)
-        output = gm.graph.find_nodes(op="output")[0]
-        with gm.graph.inserting_before(output):
-            retained = gm.graph.call_function(
-                aten.retains_grad.default, args=(output.args[0],)
-            )
-        output.args = (retained,)
-        gm.graph.lint()
-        gm.recompile()
-        self.assertFalse(gm(x))
-        self.fold_and_check_mul(gm)
-        self.assertFalse(gm(x))
+        self.check_tensor_observer(x, aten.retains_grad.default, value_kind, False)
 
     @parametrize("value_kind", ("direct", "view"))
     def test_noop_fold_preserves_autograd_output_number(self, value_kind):
-        def fn(x):
-            value = x * 1.0
-            return value.view_as(value) if value_kind == "view" else value
-
         x = torch.ones(2, requires_grad=True).unbind()[1]
         self.assertEqual(aten.output_nr.default(x), 1)
+        self.check_tensor_observer(x, aten.output_nr.default, value_kind, 0)
+
+    @parametrize("value_kind", ("direct", "view"))
+    def test_noop_fold_preserves_data_ptr(self, value_kind):
+        x = torch.tensor([1.0, 2.0])
+        self.check_tensor_observer(x, "data_ptr", value_kind, False, True)
+
+    @parametrize("value_kind", ("direct", "view"))
+    def test_noop_fold_preserves_incremented_version_target(self, value_kind):
+        def fn(x):
+            value = x * 1
+            return value.view_as(value) if value_kind == "view" else value
+
+        x = torch.tensor([1, 2])
         gm = make_fx(fn, tracing_mode="real")(x)
+        inp = gm.graph.find_nodes(op="placeholder")[0]
         output = gm.graph.find_nodes(op="output")[0]
         with gm.graph.inserting_before(output):
-            output_number = gm.graph.call_function(
-                aten.output_nr.default, args=(output.args[0],)
+            gm.graph.call_function(
+                torch._C._increment_version, args=([output.args[0]],)
             )
-        output.args = (output_number,)
+            input_version = gm.graph.call_function(aten._version.default, args=(inp,))
+        output.args = (input_version,)
         gm.graph.lint()
         gm.recompile()
-        self.assertEqual(gm(x), 0)
+        self.assertEqual(gm(x.clone()), 0)
         self.fold_and_check_mul(gm)
-        self.assertEqual(gm(x), 0)
+        self.assertEqual(gm(x.clone()), 0)
 
     @parametrize("transfer_kind", ("tensor", "storage_offset"))
     @parametrize("value_kind", ("direct", "view"))
