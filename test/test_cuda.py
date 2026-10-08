@@ -11831,10 +11831,9 @@ print(json.dumps([
     def test_use_uvm_tensor_outlives_context(self):
         # Regression test: a tensor allocated inside _use_uvm() can outlive the
         # context, leaving its block cached in the PrivatePool until a later global
-        # empty_cache() frees it. Before the fix the alloc/free ctypes closures
-        # were GC'd by then, so the free dangled and segfaulted. Loop twice and
-        # (where available) over a second device to exercise the now-shared
-        # allocator across calls/devices.
+        # empty_cache() frees it. The MemPool's allocator must keep its Python
+        # callbacks alive until then. Loop twice and (where available) over a
+        # second device to exercise independent pools across calls and devices.
         devices = [None]
         if torch.cuda.device_count() > 1:
             devices.append(1)
