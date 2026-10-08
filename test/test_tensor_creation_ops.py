@@ -2429,7 +2429,6 @@ class TestTensorCreation(TestCase):
             self.assertEqual(t[steps - 1], a[steps - 1])
 
     @onlyAccelerator
-    @skipXPU
     @largeTensorTest('16GB')
     def test_range_factories_64bit_indexing(self, device):
         bigint = 2 ** 31 + 1
