@@ -23094,6 +23094,23 @@ class NoOpFoldingTests(InductorTestCase):
         )
         self.assertEqual(gm(x.clone(), y), fn(x.clone(), y))
 
+    def test_identity_of_view_before_mm_preserves_base_mutation(self):
+        def fn(x, y):
+            view = x.view(2, 2)
+            value = view + 0
+            x.add_(10)
+            return torch.mm(value, y)
+
+        x = torch.randn(2, 2)
+        y = torch.randn(2, 2)
+        gm = make_fx(fn, tracing_mode="real")(x, y)
+        remove_no_ops(gm, OrderedSet(), OrderedSet())
+        gm.recompile()
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.add.Tensor)), 1
+        )
+        self.assertEqual(gm(x.clone(), y), fn(x.clone(), y))
+
     @parametrize(
         "op_name",
         ["add", "sub", "mul", "div"],
