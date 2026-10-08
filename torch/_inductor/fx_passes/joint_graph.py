@@ -312,6 +312,9 @@ def remove_no_ops(
         allocation_sensitive_roots: OrderedSet[torch.fx.Node] = OrderedSet()
         for current in graph.nodes:
             target = current.target
+            is_value_only_op = isinstance(
+                target, torch._ops.OpOverload
+            ) and target.namespace in ("aten", "prims")
             if target in layout_observers:
                 observed_inputs = [first_tensor_input(current)]
             elif target in (
@@ -331,10 +334,7 @@ def remove_no_ops(
             elif current.op in ("call_method", "call_module") or (
                 current.op == "call_function"
                 and target is not operator.getitem
-                and (
-                    not isinstance(target, torch._ops.OpOverload)
-                    or target.namespace not in ("aten", "prims")
-                )
+                and not is_value_only_op
             ):
                 observed_inputs = current.all_input_nodes
             elif isinstance(target, torch._ops.OpOverload) and target in (
