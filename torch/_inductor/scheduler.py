@@ -9701,29 +9701,28 @@ class Scheduler:
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         candidate_nodes = (node1, node2)
-        candidate_leaves = tuple(tuple(node.get_nodes()) for node in candidate_nodes)
-        for mutation_leaves in candidate_leaves:
-            for mutating_node in mutation_leaves:
-                for weak_dep in mutating_node._pruned_weak_deps:
-                    reading_candidate = next(
-                        (
-                            (node, leaves)
-                            for node, leaves in zip(
-                                candidate_nodes, candidate_leaves, strict=True
-                            )
-                            if any(
-                                weak_dep.name in leaf.get_buffer_names()
-                                for leaf in leaves
-                            )
+        mutation_leaves = itertools.chain.from_iterable(
+            node.get_nodes() for node in candidate_nodes
+        )
+        for mutating_node in mutation_leaves:
+            for weak_dep in mutating_node._pruned_weak_deps:
+                reading_candidates = (
+                    node
+                    for node in candidate_nodes
+                    if weak_dep.name in node.get_buffer_names()
+                )
+                first_reader = next(reading_candidates, None)
+                if first_reader is not None and not self._fusable_weak_dep_for_readers(
+                    weak_dep,
+                    itertools.chain(
+                        first_reader.get_nodes(),
+                        itertools.chain.from_iterable(
+                            node.get_nodes() for node in reading_candidates
                         ),
-                        None,
-                    )
-                    if reading_candidate is not None and not self.fusable_weak_dep(
-                        weak_dep,
-                        reading_candidate[0],
-                        mutating_node,
-                    ):
-                        return False
+                    ),
+                    mutating_node,
+                ):
+                    return False
         return True
 
     def shared_data_after_reordering_loop(
@@ -11004,11 +11003,19 @@ class Scheduler:
         if weak_dep.name not in node1.get_buffer_names():
             return False
 
+        return self._fusable_weak_dep_for_readers(weak_dep, node1.get_nodes(), node2)
+
+    def _fusable_weak_dep_for_readers(
+        self,
+        weak_dep: WeakDep,
+        reading_nodes: Iterable[BaseSchedulerNode],
+        mutating_node: BaseSchedulerNode,
+    ) -> bool:
         # A weak dep can be fused if and only if the fused operation acts inplace
         # on the buffer being mutated. i.e. the same index is being read then mutated
         mutating_writes = [
             write
-            for write in node2.read_writes.writes
+            for write in mutating_node.read_writes.writes
             if write.name == weak_dep.mutating_buf
         ]
         if len(mutating_writes) != 1:
@@ -11030,7 +11037,7 @@ class Scheduler:
 
         real_name = self.mutation_real_name[weak_dep.mutating_buf]
         num_concurrent_reads = 0
-        for reading_node in node1.get_nodes():
+        for reading_node in reading_nodes:
             # A read of an earlier mutation of the same buffer (the output of an
             # index_put_ into it, say) reads the same memory under another name.
             relevant_reads = [
@@ -11040,7 +11047,7 @@ class Scheduler:
             ]
             if not relevant_reads:
                 continue
-            device = node2.get_device()
+            device = mutating_node.get_device()
             if device is not None and (
                 (device.type == "cpu" and config.cpu_backend == "halide")
                 or (device.type == "cuda" and config.cuda_backend == "halide")
