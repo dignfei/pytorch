@@ -23055,6 +23055,23 @@ def _run_and_get_stripped_kernels(
 
 @instantiate_parametrized_tests
 class NoOpFoldingTests(InductorTestCase):
+    def test_identity_before_mm_is_folded(self):
+        def fn(x, y):
+            return torch.mm(x + 0, y)
+
+        x = torch.randn(2, 2)
+        y = torch.randn(2, 2)
+        gm = make_fx(fn, tracing_mode="real")(x, y)
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.add.Tensor)), 1
+        )
+        remove_no_ops(gm, OrderedSet(), OrderedSet())
+        gm.recompile()
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.add.Tensor)), 0
+        )
+        self.assertEqual(gm(x, y), fn(x, y))
+
     @parametrize(
         "op_name",
         ["add", "sub", "mul", "div"],

@@ -146,15 +146,23 @@ def remove_no_ops(
                 )
             )
 
-        def can_reuse_mm_allocation(node, replacement):
+        mm_targets = (aten.mm.default, aten.bmm.default, aten.addmm.default)
+
+        def can_fold_identity(node, replacement):
+            if not isinstance(replacement, torch.fx.Node) or not same_metadata(
+                node, replacement
+            ):
+                return False
+            sole_user = next(iter(node.users), None) if len(node.users) == 1 else None
             return (
-                isinstance(replacement, torch.fx.Node)
-                and replacement.op == "call_function"
-                and replacement.target
-                in (aten.mm.default, aten.bmm.default, aten.addmm.default)
+                replacement.op == "call_function"
+                and replacement.target in mm_targets
                 and len(replacement.users) == 1
                 and node in replacement.users
-                and same_metadata(node, replacement)
+            ) or (
+                sole_user is not None
+                and sole_user.op == "call_function"
+                and sole_user.target in mm_targets
             )
 
         for target in (
@@ -165,7 +173,7 @@ def remove_no_ops(
         ):
             for node in list(graph.find_nodes(op="call_function", target=target)):
                 replacement = identity_replacement(node)
-                if not can_reuse_mm_allocation(node, replacement):
+                if not can_fold_identity(node, replacement):
                     continue
                 node.replace_all_uses_with(replacement)
                 graph.erase_node(node)
