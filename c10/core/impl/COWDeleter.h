@@ -1,11 +1,15 @@
 #pragma once
 
+#include <c10/core/Event.h>
+#include <c10/core/Stream.h>
 #include <c10/macros/Export.h>
 #include <c10/util/UniqueVoidPtr.h>
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <variant>
 
@@ -45,6 +49,47 @@ class C10_API COWDeleterContext {
   // do with it.
   std::variant<NotLastReference, LastReference> decrement_refcount();
 
+  // Returns true if there is only a single reference to this context. Only
+  // meaningful when called through that reference, since no new references
+  // can be created concurrently in that case.
+  bool is_unique() const;
+
+  // On devices whose streams are tracked (see COW.cpp), all references to
+  // the data share the stream they were made on, and whether that stream was
+  // being captured into a graph then.
+
+  // Sets the stream and capture state of a new context, before any other
+  // reference to it is made.
+  void init_stream(c10::Stream stream, bool captured);
+
+  // Called through an existing reference when lazily cloning the data on
+  // `stream`. If this is the only reference, moves the context to `stream`
+  // and `captured` (keeping pending copies ordered before later steals);
+  // otherwise, they must match the context's. Then increments the refcount
+  // and returns true, or returns false (without changing anything) if the
+  // data must be cloned eagerly instead. Safe to call concurrently through
+  // the same reference, since lazy cloning is logically a read.
+  bool share(c10::Stream stream, bool captured);
+
+  // The stream and capture state, which can only change through share() on
+  // the only reference, so reading them through any reference is safe
+  // (concurrent lazy clones of that reference aside).
+  std::optional<c10::Stream> stream() const {
+    return stream_;
+  }
+  bool captured() const {
+    return captured_;
+  }
+
+  // Records an event after a copy of the data was enqueued on stream().
+  // Must be called before the reference that made the copy is decremented.
+  void record_copy_event();
+
+  // Makes `stream` wait (on the device) for the copies recorded with
+  // record_copy_event(), if they were enqueued on another stream. Must be
+  // called through the only remaining reference.
+  void wait_for_copies(c10::Stream stream);
+
  private:
   // The destructor is hidden, this should only ever be used within
   // UniqueVoidPtr using cow::delete_context as the deleter.
@@ -53,6 +98,15 @@ class C10_API COWDeleterContext {
   std::shared_mutex mutex_;
   std::unique_ptr<void, DeleterFnPtr> data_;
   std::atomic<std::int64_t> refcount_ = 1;
+
+  // Guards the members below, and makes share() atomic.
+  std::mutex stream_mutex_;
+  std::optional<c10::Stream> stream_;
+  bool captured_ = false;
+  // An event recorded after the last copy of the data, and the stream it was
+  // recorded on.
+  std::optional<c10::Event> copy_event_;
+  std::optional<c10::Stream> copy_event_stream_;
 };
 
 // `cow_deleter` is used as the `ctx_deleter` for DataPtr to implement a COW
