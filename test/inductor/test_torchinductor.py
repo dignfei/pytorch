@@ -23498,7 +23498,17 @@ class NoOpFoldingTests(InductorTestCase):
             return value.sin(), value @ value
 
         x = torch.arange(4, dtype=torch.int64).reshape(2, 2)
-        self.assertEqual(torch.compile(fn, fullgraph=True)(x), fn(x))
+        gm = make_fx(fn, tracing_mode="real")(x)
+        mul = gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)[0]
+        expected_meta = mul.meta["tensor_meta"]
+        self.fold_and_check_mul(gm, 0)
+        conversion = gm.graph.find_nodes(
+            op="call_function", target=torch.ops.prims.convert_element_type.default
+        )[0]
+        self.assertEqual(conversion.meta["tensor_meta"], expected_meta)
+        self.assertEqual(conversion.meta["val"].dtype, torch.float32)
+        self.assertEqual(gm(x), fn(x))
+        self.assertEqual(torch.compile(gm, fullgraph=True)(x), fn(x))
 
     def test_noop_fold_preserves_direct_output_conversion(self):
         def fn(x):

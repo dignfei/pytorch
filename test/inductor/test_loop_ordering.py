@@ -704,38 +704,33 @@ class LoopOrderingTest(TestCase):
         # some buffer is used before being defined.
         f(input_ids, labels, position_ids)
 
+    def check_inplace_transpose_copy(self, fn):
+        x = torch.rand(80000, 5, 5, device=self.device)
+        expected = fn(x.clone())
+        actual = torch.compile(fn)(x.clone())
+        self.assertEqual(actual, expected)
+        self.assertEqual(metrics.generated_kernel_count, 2)
+
     def test_inplace_transpose_copy(self):
         def f(x):
             x.copy_(x.transpose(-1, -2) * 1.0)
             return x
 
-        x = torch.rand(80000, 5, 5, device=self.device)
-        expected = f(x.clone())
-        actual = torch.compile(f)(x.clone())
-        self.assertEqual(actual, expected)
-        self.assertEqual(metrics.generated_kernel_count, 2)
+        self.check_inplace_transpose_copy(f)
 
     def test_inplace_pointwise_transpose_copy(self):
         def f(x):
             x.copy_((x + 1).transpose(-1, -2))
             return x
 
-        x = torch.rand(80000, 5, 5, device=self.device)
-        expected = f(x.clone())
-        actual = torch.compile(f)(x.clone())
-        self.assertEqual(actual, expected)
-        self.assertEqual(metrics.generated_kernel_count, 2)
+        self.check_inplace_transpose_copy(f)
 
     def test_inplace_foreach_transpose_copy(self):
         def f(x):
             torch._foreach_copy_([x], [x.transpose(-1, -2) * 1.0])
             return x
 
-        x = torch.rand(80000, 5, 5, device=self.device)
-        expected = f(x.clone())
-        actual = torch.compile(f)(x.clone())
-        self.assertEqual(actual, expected)
-        self.assertEqual(metrics.generated_kernel_count, 2)
+        self.check_inplace_transpose_copy(f)
 
     def test_inplace_transpose_copy_through_view(self):
         def f(base):
@@ -743,11 +738,7 @@ class LoopOrderingTest(TestCase):
             x.copy_(x.transpose(-1, -2) * 1.0)
             return base
 
-        x = torch.rand(80000, 5, 5, device=self.device)
-        expected = f(x.clone())
-        actual = torch.compile(f)(x.clone())
-        self.assertEqual(actual, expected)
-        self.assertEqual(metrics.generated_kernel_count, 2)
+        self.check_inplace_transpose_copy(f)
 
     def test_inplace_transpose_copy_after_mutation(self):
         with scoped_add_one("test_loop_ordering") as add_one_:
@@ -757,11 +748,7 @@ class LoopOrderingTest(TestCase):
                 x.copy_(x.transpose(-1, -2) * 1.0)
                 return x
 
-            x = torch.rand(80000, 5, 5, device=self.device)
-            expected = f(x.clone())
-            actual = torch.compile(f)(x.clone())
-            self.assertEqual(actual, expected)
-            self.assertEqual(metrics.generated_kernel_count, 2)
+            self.check_inplace_transpose_copy(f)
 
     def test_pruned_mutation_dep_after_sibling_reordering(self):
         def f(x):
