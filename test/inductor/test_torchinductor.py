@@ -23089,7 +23089,7 @@ class NoOpFoldingTests(InductorTestCase):
         remove_no_ops(gm, OrderedSet(), OrderedSet())
         gm.recompile()
         self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
+            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 0
         )
         self.assertEqual(gm(x), fn(x))
 
@@ -23401,6 +23401,24 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertEqual(gm(shifted), expected)
 
+    @parametrize("view_kind", ("reshape_alias", "unsafe_view"))
+    def test_noop_fold_preserves_layout_alias_on_runtime_input(self, view_kind):
+        def fn(x):
+            value = x * 1.0
+            if view_kind == "reshape_alias":
+                value = aten._reshape_alias.default(value, [6], [1])
+            else:
+                value = aten._unsafe_view.default(value, [6])
+            return value.sin()
+
+        trace_input = torch.arange(6.0).reshape(3, 2)
+        runtime_input = torch.arange(12.0).reshape(3, 4)[:, :2]
+        gm = make_fx(fn, tracing_mode="real")(trace_input)
+        expected = fn(runtime_input)
+        self.assertEqual(gm(runtime_input), expected)
+        self.fold_and_check_mul(gm)
+        self.assertEqual(gm(runtime_input), expected)
+
     @parametrize("view_kind", ("direct", "chained"))
     def test_noop_fold_preserves_unsafe_view_alias(self, view_kind):
         def fn(x):
@@ -23463,6 +23481,48 @@ class NoOpFoldingTests(InductorTestCase):
         self.assertEqual(gm(shifted), expected)
         self.fold_and_check_mul(gm, 0)
         self.assertEqual(gm(shifted), expected)
+
+    def test_noop_fold_stops_expanded_layout_guard_at_allocation(self):
+        def fn(x):
+            return (x * 1.0).sin()
+
+        x = torch.ones(1).expand(4)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        self.assertEqual(gm(x), fn(x))
+        self.fold_and_check_mul(gm, 0)
+        placeholder = gm.graph.find_nodes(op="placeholder")[0]
+        self.assertEqual(placeholder.meta["val"].stride(), (0,))
+        self.assertEqual(placeholder.meta["tensor_meta"].stride, (0,))
+        self.assertEqual(gm(x), fn(x))
+
+    def test_noop_fold_preserves_synthesized_conversion_metadata(self):
+        def fn(x):
+            value = x * 1.0
+            return value.sin(), value @ value
+
+        x = torch.arange(4, dtype=torch.int64).reshape(2, 2)
+        self.assertEqual(torch.compile(fn, fullgraph=True)(x), fn(x))
+
+    def test_noop_fold_preserves_direct_output_conversion(self):
+        def fn(x):
+            return x * 1.0
+
+        x = torch.arange(4, dtype=torch.int64)
+        gm = make_fx(fn, tracing_mode="real")(x)
+        self.fold_and_check_mul(gm, 0)
+        actual = gm(x)
+        self.assertEqual(actual, fn(x))
+        self.assertFalse(torch._C._is_alias_of(actual, x))
+
+    def test_noop_fold_preserves_view_layout(self):
+        def fn(x):
+            return (x * 1.0).view(-1).sin()
+
+        x = torch.arange(12.0).reshape(3, 4)[:, ::2]
+        gm = make_fx(fn, tracing_mode="real")(x)
+        self.assertEqual(gm(x), fn(x))
+        self.fold_and_check_mul(gm)
+        self.assertEqual(gm(x), fn(x))
 
     @parametrize(
         "observer_kind",

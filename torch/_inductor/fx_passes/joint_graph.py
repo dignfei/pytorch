@@ -137,6 +137,37 @@ def remove_no_ops(
                         return None
             return index
 
+        def materialize_meta_outputs():
+            # meta tensors returned from the graph have no data and can be replaced with empty_strided
+            for output_node in graph.find_nodes(op="output"):
+                had_meta_return = False
+
+                def visit(n):
+                    nonlocal had_meta_return
+                    val = n.meta.get("val")
+                    if isinstance(val, torch.Tensor) and val.device.type == "meta":
+                        with graph.inserting_before(output_node):
+                            # size/stride may be symbolic under dynamic shapes;
+                            # materialize them so we never pass raw SymInts as args.
+                            # Use materialize_symints (roots backed sizes on input
+                            # placeholders) rather than create_size_node(n, d), which
+                            # would query `n` and pin it alive, blocking the
+                            # eliminate_dead_code() that removes this meta tensor.
+                            size = graph.materialize_symints(val.size())
+                            stride = graph.materialize_symints(val.stride())
+                            n.replace_all_uses_with(
+                                graph.call_function(
+                                    torch.ops.aten.empty_strided.default,
+                                    args=(size, stride),
+                                    kwargs={"dtype": val.dtype, "device": val.device},
+                                )
+                            )
+                        had_meta_return = True
+
+                torch.fx.map_arg(output_node.args, visit)
+                if had_meta_return:
+                    graph.eliminate_dead_code()
+
         # Match once, in the original per-target pass order, and reuse the
         # candidates after constructing the allocation and alias indexes.
         candidates = [
@@ -150,15 +181,8 @@ def remove_no_ops(
             for node in graph.find_nodes(op="call_function", target=target)
             if (index := identity_replacement_index(node)) is not None
         ]
-        if not candidates and not any(
-            isinstance(val := leaf.meta.get("val"), torch.Tensor)
-            and val.device.type == "meta"
-            for result in graph.find_nodes(op="output")
-            for leaf in pytree.tree_leaves(result.args)
-            if isinstance(leaf, torch.fx.Node)
-        ):
-            # The base pass also materializes returned meta tensors; leave that
-            # path below intact, but skip unused allocation indexes otherwise.
+        if not candidates:
+            materialize_meta_outputs()
             return
 
         mutated_storages = get_mutated_storages(gm)
@@ -172,34 +196,14 @@ def remove_no_ops(
         def fake_tensors_eq(
             t1,
             t2,
-            fields=(
-                "shape",
-                "dtype",
-                "device",
-                "stride",
-                "storage_offset",
-                "is_conj",
-                "is_neg",
-            ),
+            fields=("shape", "dtype", "device"),
         ):
             if any(not isinstance(t, torch.Tensor) for t in (t1, t2)):
                 return False
-            # Layout-specific metadata such as strides and storage offsets is
-            # unavailable on some sparse layouts. Preserve those allocations.
-            if t1.layout != t2.layout or t1.layout != torch.strided:
-                return False
             for field in fields:
-                v1 = (
-                    getattr(t1, field)()
-                    if field in ("stride", "storage_offset", "is_conj", "is_neg")
-                    else getattr(t1, field)
-                )
-                v2 = (
-                    getattr(t2, field)()
-                    if field in ("stride", "storage_offset", "is_conj", "is_neg")
-                    else getattr(t2, field)
-                )
-                if field in ("shape", "stride", "storage_offset"):
+                v1 = getattr(t1, field)
+                v2 = getattr(t2, field)
+                if field == "shape":
                     # Shapes may contain unbacked SymInts; tuple `!=` would
                     # force a guard. Conservatively treat unknown as "not equal".
                     if not guard_or_false(sym_eq(v1, v2)):
@@ -271,6 +275,8 @@ def remove_no_ops(
             aten.as_strided.default,
             aten.as_strided_copy.default,
             aten.as_strided_scatter.default,
+            aten._reshape_alias.default,
+            aten._unsafe_view.default,
             aten._debug_has_internal_overlap.default,
             aten._assert_tensor_metadata.default,
             aten.is_contiguous.default,
@@ -284,6 +290,7 @@ def remove_no_ops(
             aten.sym_storage_offset.default,
             aten.sym_stride.default,
             aten.sym_stride.int,
+            aten.view.default,
             aten.view_as_complex.default,
             aten.view_as_complex_copy.default,
             aten.view.dtype,
@@ -297,9 +304,10 @@ def remove_no_ops(
         # native or custom identity observer and mutator.
         allocation_sensitive_roots: OrderedSet[torch.fx.Node] = OrderedSet()
         for current in graph.nodes:
-            if current.target in layout_observers:
+            target = current.target
+            if target in layout_observers:
                 observed_inputs = [first_tensor_input(current)]
-            elif current.target in (
+            elif target in (
                 aten.is_set_to.default,
                 aten.is_pinned.default,
                 aten.is_conj.default,
@@ -315,14 +323,14 @@ def remove_no_ops(
                 observed_inputs = current.all_input_nodes
             elif current.op in ("call_method", "call_module") or (
                 current.op == "call_function"
-                and current.target is not operator.getitem
+                and target is not operator.getitem
                 and (
-                    not isinstance(current.target, torch._ops.OpOverload)
-                    or current.target.namespace not in ("aten", "prims")
+                    not isinstance(target, torch._ops.OpOverload)
+                    or target.namespace not in ("aten", "prims")
                 )
             ):
                 observed_inputs = current.all_input_nodes
-            elif current.target in (
+            elif isinstance(target, torch._ops.OpOverload) and target in (
                 aten.set.source_Tensor,
                 aten.set.source_Tensor_out,
                 aten.set_.source_Tensor,
@@ -333,18 +341,21 @@ def remove_no_ops(
                 observed_inputs = [
                     value
                     for schema_arg, value in zip_schema(
-                        current.target._schema, current.args, current.kwargs
+                        target._schema, current.args, current.kwargs
                     )
                     if schema_arg.name in ("source", "new_data")
                     and isinstance(value, torch.fx.Node)
                 ]
-            elif current.target is aten._new_zeros_with_same_feature_meta.default:
+            elif (
+                isinstance(target, torch._ops.OpOverload)
+                and target is aten._new_zeros_with_same_feature_meta.default
+            ):
                 # This allocation inherits the *storage capacity* of other,
                 # not only its visible shape and strides.
                 observed_inputs = [
                     value
                     for schema_arg, value in zip_schema(
-                        current.target._schema, current.args, current.kwargs
+                        target._schema, current.args, current.kwargs
                     )
                     if schema_arg.name == "other" and isinstance(value, torch.fx.Node)
                 ]
@@ -404,9 +415,21 @@ def remove_no_ops(
         def is_mutated(n):
             return alias_root(n) in mutated_roots
 
+        def update_direct_output_index(node, replacement, node_storage):
+            replacement_root = alias_root(replacement)
+            replacement_storage = storages.get(replacement)
+            output_roots[node] -= 1
+            output_roots[replacement_root] += 1
+            output_pairs[node, node_storage] -= 1
+            output_pairs[replacement_root, replacement_storage] += 1
+            output_storages[node_storage] -= 1
+            if replacement_storage is not None:
+                output_storages[replacement_storage] += 1
+
         def replace_no_op(node, replace_input_index):
             nonlocal output_index_dirty
             replacement = node.args[replace_input_index]
+            synthesized_replacement = False
 
             # https://github.com/pytorch/pytorch/issues/86128 causes
             # non-Tensor inputs even for ops with only Tensor inputs.
@@ -417,17 +440,6 @@ def remove_no_ops(
                 ) or not isinstance(replacement, torch.fx.Node):
                     return
 
-            # https://github.com/pytorch/pytorch/issues/174187
-            # Retain the allocation when a write or output alias would become visible.
-            if (
-                is_mutated(replacement)
-                or is_mutated(node)
-                or changes_output_aliases(node, replacement)
-                or replacement in unresolved_bit_views
-                or alias_root(node) in allocation_sensitive_roots
-            ):
-                return
-
             if not fake_tensors_eq(node.meta["val"], replacement.meta["val"]):
                 if fake_tensors_eq(
                     node.meta["val"],
@@ -435,10 +447,6 @@ def remove_no_ops(
                     (
                         "shape",
                         "device",
-                        "stride",
-                        "storage_offset",
-                        "is_conj",
-                        "is_neg",
                     ),
                 ):
                     with graph.inserting_after(node):
@@ -446,8 +454,20 @@ def remove_no_ops(
                             torch.ops.prims.convert_element_type.default,
                             args=(replacement, node.meta["val"].dtype),
                         )
+                        synthesized_replacement = True
                 else:
                     return
+
+            # https://github.com/pytorch/pytorch/issues/174187
+            # Retain the allocation when a write or output alias would become visible.
+            if not synthesized_replacement and (
+                is_mutated(replacement)
+                or is_mutated(node)
+                or changes_output_aliases(node, replacement)
+                or replacement in unresolved_bit_views
+                or alias_root(node) in allocation_sensitive_roots
+            ):
+                return
 
             node_storage = storages.get(node)
             # A unique, directly returned allocation needs only one index
@@ -461,18 +481,14 @@ def remove_no_ops(
                 and not any(alias_base(user) is node for user in node.users)
             )
             node.replace_all_uses_with(replacement)
-            replacement.meta.update(node.meta)
+            diagnostic_meta = node.meta.copy()
+            if not synthesized_replacement:
+                diagnostic_meta.pop("val", None)
+                diagnostic_meta.pop("tensor_meta", None)
+            replacement.meta.update(diagnostic_meta)
             graph.erase_node(node)
             if single_direct_output:
-                replacement_root = alias_root(replacement)
-                replacement_storage = storages.get(replacement)
-                output_roots[node] -= 1
-                output_roots[replacement_root] += 1
-                output_pairs[node, node_storage] -= 1
-                output_pairs[replacement_root, replacement_storage] += 1
-                output_storages[node_storage] -= 1
-                if replacement_storage is not None:
-                    output_storages[replacement_storage] += 1
+                update_direct_output_index(node, replacement, node_storage)
             elif output_roots[node] or (
                 node_storage is not None and output_storages[node_storage]
             ):
@@ -481,35 +497,7 @@ def remove_no_ops(
         for node, index in candidates:
             replace_no_op(node, index)
 
-        # meta tensors returned from the graph have no data and can be replaced with empty_strided
-        for output_node in graph.find_nodes(op="output"):
-            had_meta_return = False
-
-            def visit(n):
-                nonlocal had_meta_return
-                val = n.meta.get("val")
-                if isinstance(val, torch.Tensor) and val.device.type == "meta":
-                    with graph.inserting_before(output_node):
-                        # size/stride may be symbolic under dynamic shapes;
-                        # materialize them so we never pass raw SymInts as args.
-                        # Use materialize_symints (roots backed sizes on input
-                        # placeholders) rather than create_size_node(n, d), which
-                        # would query `n` and pin it alive, blocking the
-                        # eliminate_dead_code() that removes this meta tensor.
-                        size = graph.materialize_symints(val.size())
-                        stride = graph.materialize_symints(val.stride())
-                        n.replace_all_uses_with(
-                            graph.call_function(
-                                torch.ops.aten.empty_strided.default,
-                                args=(size, stride),
-                                kwargs={"dtype": val.dtype, "device": val.device},
-                            )
-                        )
-                    had_meta_return = True
-
-            torch.fx.map_arg(output_node.args, visit)
-            if had_meta_return:
-                graph.eliminate_dead_code()
+        materialize_meta_outputs()
 
 
 def remove_redundant_views(gm: torch.fx.GraphModule):

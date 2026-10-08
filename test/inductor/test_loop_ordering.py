@@ -16,6 +16,7 @@ from torch._dynamo.utils import same
 from torch._inductor import config as inductor_config, ir, metrics
 from torch._inductor.codegen.simd import MemoryCoalescing, SIMDScheduling
 from torch._inductor.codegen.triton import TritonScheduling
+from torch._inductor.dependencies import WeakDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.inductor_prims import force_stride_order
 from torch._inductor.invert_expr_analysis import generate_inverse_formula
@@ -819,20 +820,43 @@ class LoopOrderingTest(TestCase):
             x.copy_(producer)
             return x, sibling
 
+        captured_nodes = None
+
+        def capture(nodes):
+            nonlocal captured_nodes
+            captured_nodes = nodes
+            return nodes
+
         def inspect(nodes):
-            scheduler = nodes[0].scheduler
-            scheduler.prune_redundant_deps(nodes)
-            self.assertEqual(len(nodes), 4)
-            fused_reader = FusedSchedulerNode.fuse(nodes[0], nodes[1])
-            self.assertEqual(len(nodes[3]._pruned_weak_deps), 1)
-            self.assertFalse(
-                scheduler._pruned_weak_deps_still_fusable(fused_reader, nodes[3])
+            if captured_nodes is None:
+                raise AssertionError("expected pre-fusion nodes")
+            scheduler = captured_nodes[0].scheduler
+            self.assertEqual(len(captured_nodes), 4)
+            fused_reader = FusedSchedulerNode.fuse(captured_nodes[0], captured_nodes[1])
+            mutating_node = captured_nodes[3]
+            original_read_writes = mutating_node.read_writes
+            live_weak_deps = OrderedSet(
+                dep
+                for dep in mutating_node.unmet_dependencies
+                if isinstance(dep, WeakDep)
             )
+            try:
+                mutating_node.set_read_writes(
+                    mutating_node.read_writes.remove_reads(live_weak_deps)
+                )
+                self.assertEqual(len(mutating_node._pruned_weak_deps), 1)
+                self.assertTrue(scheduler._can_fuse_impl(fused_reader, mutating_node))
+                self.assertFalse(scheduler.can_fuse(fused_reader, mutating_node))
+            finally:
+                mutating_node.set_read_writes(original_read_writes)
             return nodes
 
         x = torch.rand(1024, device=self.device)
         expected = f(x.clone())
-        with inductor_config.patch(_pre_fusion_custom_pass=inspect):
+        with inductor_config.patch(
+            _pre_fusion_custom_pass=capture,
+            _post_fusion_custom_pass=inspect,
+        ):
             actual = torch.compile(f)(x.clone())
         self.assertEqual(actual, expected)
 
