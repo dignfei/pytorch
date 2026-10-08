@@ -28,6 +28,7 @@ from torch.fx.experimental.symbolic_shapes import (
     statically_known_true,
     sym_eq,
 )
+from torch.fx.passes.reinplace import _is_view_op
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._ordered_set import OrderedSet
 
@@ -166,7 +167,34 @@ def remove_no_ops(
                     if alias in get_mutated_input_nodes(user):
                         return True
                     target = user.target
+                    if (
+                        target is operator.getitem
+                        and user.args[0] is alias
+                        and isinstance(alias.meta.get("val"), (tuple, list))
+                        and isinstance(user.meta.get("val"), torch.Tensor)
+                    ):
+                        if user not in aliases:
+                            aliases.add(user)
+                            worklist.append(user)
+                        continue
                     if not isinstance(target, torch._ops.OpOverload):
+                        continue
+                    if (
+                        user.args
+                        and user.args[0] is alias
+                        and (
+                            target
+                            in (
+                                aten._unsafe_view.default,
+                                aten.data.default,
+                                aten.lift.default,
+                            )
+                            or _is_view_op(target) is True
+                        )
+                    ):
+                        if user not in aliases:
+                            aliases.add(user)
+                            worklist.append(user)
                         continue
                     return_aliases = OrderedSet().union(
                         *(
@@ -197,6 +225,20 @@ def remove_no_ops(
             if replacement_is_mutated(replacement):
                 return False
             sole_user = next(iter(node.users), None) if len(node.users) == 1 else None
+            value_consumer = False
+            if sole_user is not None and isinstance(
+                sole_user.target, torch._ops.OpOverload
+            ):
+                target = sole_user.target
+                value_consumer = (
+                    sole_user.op == "call_function"
+                    and not target._schema.is_mutable
+                    and all(ret.alias_info is None for ret in target._schema.returns)
+                    and (
+                        torch.Tag.pointwise in target.tags
+                        or torch.Tag.reduction in target.tags
+                    )
+                )
             return (
                 replacement.op == "call_function"
                 and replacement.target in mm_targets
@@ -204,7 +246,7 @@ def remove_no_ops(
             ) or (
                 sole_user is not None
                 and sole_user.op == "call_function"
-                and sole_user.target in mm_targets
+                and (sole_user.target in mm_targets or value_consumer)
             )
 
         for target in (

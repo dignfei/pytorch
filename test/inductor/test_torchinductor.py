@@ -23072,12 +23072,14 @@ class NoOpFoldingTests(InductorTestCase):
         )
         self.assertEqual(gm(x, y), fn(x, y))
 
-    @parametrize("mutation", ["direct", "view"])
+    @parametrize("mutation", ["direct", "view", "unbind"])
     def test_identity_before_mm_preserves_mutated_replacement(self, mutation):
         def fn(x, y):
             value = x + 0
             if mutation == "view":
                 x.view(-1).add_(10)
+            elif mutation == "unbind":
+                torch.unbind(x)[0].add_(10)
             else:
                 x.add_(10)
             return torch.mm(value, y)
@@ -23096,21 +23098,19 @@ class NoOpFoldingTests(InductorTestCase):
         "op_name",
         ["add", "sub", "mul", "div"],
     )
-    def test_allocating_identity_is_not_folded(self, op_name):
+    @parametrize("consumer", ["sin", "sum"])
+    def test_identity_before_value_consumer_is_folded(self, op_name, consumer):
         op = getattr(aten, op_name).Tensor
         identity = 0 if op_name in ("add", "sub") else 1
 
         def fn(x):
-            return op(x, identity).sin()
+            return getattr(torch, consumer)(op(x, identity))
 
         x = torch.ones(2)
         gm = make_fx(fn, tracing_mode="real")(x)
         remove_no_ops(gm, OrderedSet(), OrderedSet())
         gm.recompile()
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=op)),
-            1,
-        )
+        self.assertEqual(len(gm.graph.find_nodes(op="call_function", target=op)), 0)
         self.assertEqual(gm(x), fn(x))
 
 
