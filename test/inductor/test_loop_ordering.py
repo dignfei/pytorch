@@ -836,6 +836,30 @@ class LoopOrderingTest(TestCase):
             actual = torch.compile(f)(x.clone())
         self.assertEqual(actual, expected)
 
+    def test_pruned_weak_dep_checks_mutator_fused_siblings(self):
+        def f(x):
+            producer = realize(x * 2.0)
+            sibling = realize(torch.roll(x, 1) + 3.0)
+            x.copy_(producer)
+            return x, sibling
+
+        def inspect(nodes):
+            scheduler = nodes[0].scheduler
+            scheduler.prune_redundant_deps(nodes)
+            self.assertEqual(len(nodes), 4)
+            fused_mutator = FusedSchedulerNode.fuse(nodes[1], nodes[3])
+            self.assertEqual(len(nodes[3]._pruned_weak_deps), 1)
+            self.assertFalse(
+                scheduler._pruned_weak_deps_still_fusable(nodes[0], fused_mutator)
+            )
+            return nodes
+
+        x = torch.rand(1024, device=self.device)
+        expected = f(x.clone())
+        with inductor_config.patch(_pre_fusion_custom_pass=inspect):
+            actual = torch.compile(f)(x.clone())
+        self.assertEqual(actual, expected)
+
     def test_different_broadcast_shapes(self):
         def f(x, y, c):
             return x + c, y + c

@@ -9701,20 +9701,15 @@ class Scheduler:
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         candidate_nodes = (node1, node2)
-        mutation_leaves = itertools.chain.from_iterable(
-            node.get_nodes() for node in candidate_nodes
-        )
-        for mutating_node in mutation_leaves:
+        candidate_leaves = tuple(node.get_nodes() for node in candidate_nodes)
+        all_leaves = tuple(itertools.chain.from_iterable(candidate_leaves))
+        for mutating_node in all_leaves:
             for weak_dep in mutating_node._pruned_weak_deps:
-                reading_leaves = tuple(
-                    leaf
-                    for node in candidate_nodes
-                    if weak_dep.name in node.get_buffer_names()
-                    for leaf in node.get_nodes()
-                )
-                if reading_leaves and not self._fusable_weak_dep_for_readers(
+                if any(
+                    weak_dep.name in node.get_buffer_names() for node in candidate_nodes
+                ) and not self._fusable_weak_dep_for_readers(
                     weak_dep,
-                    reading_leaves,
+                    (leaf for leaf in all_leaves if leaf is not mutating_node),
                     mutating_node,
                 ):
                     return False

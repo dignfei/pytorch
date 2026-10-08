@@ -158,7 +158,6 @@ def remove_no_ops(
                 replacement.op == "call_function"
                 and replacement.target in mm_targets
                 and len(replacement.users) == 1
-                and node in replacement.users
             ) or (
                 sole_user is not None
                 and sole_user.op == "call_function"
