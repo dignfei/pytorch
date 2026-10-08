@@ -15,7 +15,7 @@ from torch._dynamo.utils import counters
 from torch._higher_order_ops.flex_gemm import _PRESERVE_FLEX_GEMM_GEMM_OP
 from torch._inductor.constant_folding import ConstantFolder
 from torch._inductor.fx_passes.dedupe_symint_uses import _SymHashingDict
-from torch._inductor.fx_utils import get_mutated_input_nodes, get_node_storage
+from torch._inductor.fx_utils import get_mutated_storages, get_node_storage
 from torch._inductor.utils import get_gpu_type
 from torch._library.utils import zip_schema
 from torch.fx.experimental.symbolic_shapes import (
@@ -147,16 +147,14 @@ def remove_no_ops(
             )
 
         mm_targets = (aten.mm.default, aten.bmm.default, aten.addmm.default)
+        mutated_storages = get_mutated_storages(gm)
 
         def can_fold_identity(node, replacement):
             if not isinstance(replacement, torch.fx.Node) or not same_metadata(
                 node, replacement
             ):
                 return False
-            if any(
-                replacement in get_mutated_input_nodes(user)
-                for user in replacement.users
-            ):
+            if get_node_storage(replacement) in mutated_storages:
                 return False
             sole_user = next(iter(node.users), None) if len(node.users) == 1 else None
             return (

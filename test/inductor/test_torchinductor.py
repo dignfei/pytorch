@@ -23072,10 +23072,14 @@ class NoOpFoldingTests(InductorTestCase):
         )
         self.assertEqual(gm(x, y), fn(x, y))
 
-    def test_identity_before_mm_preserves_mutated_replacement(self):
+    @parametrize("mutation", ["direct", "view"])
+    def test_identity_before_mm_preserves_mutated_replacement(self, mutation):
         def fn(x, y):
             value = x + 0
-            x.add_(10)
+            if mutation == "view":
+                x.view(-1).add_(10)
+            else:
+                x.add_(10)
             return torch.mm(value, y)
 
         x = torch.randn(2, 2)
