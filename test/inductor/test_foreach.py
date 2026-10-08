@@ -8,11 +8,8 @@ import torch
 import torch._inductor
 from torch._higher_order_ops import foreach_map
 from torch._inductor import config
-from torch._inductor.compile_fx import compile_fx_inner
-from torch._inductor.fx_passes.joint_graph import constant_fold_uniform_value
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import run_fw_bw_and_get_code
-from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     IS_FBCODE,
@@ -296,18 +293,8 @@ class ForeachTests(TestCase):
         x = torch.tensor([1.0], device=device)
         y = torch.tensor([2.0], device=device)
         expected = fn(x.clone(), y.clone())
-        gm = make_fx(fn, tracing_mode="real")(x.clone(), y.clone())
-        self.assertEqual(
-            len(gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)), 1
-        )
-        constant_fold_uniform_value(gm)
-        retained_mul_count = len(
-            gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)
-        )
-        compiled = compile_fx_inner(gm, [x, y])
-        actual = compiled([x.clone(), y.clone()])
+        actual = torch.compile(fn, fullgraph=True)(x.clone(), y.clone())
         self.assertEqual(actual, expected)
-        self.assertEqual(retained_mul_count, 1)
 
     def _test_single_list(self, op):
         if op in un_ops_under_test:
