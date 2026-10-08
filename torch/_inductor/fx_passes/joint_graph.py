@@ -15,7 +15,11 @@ from torch._dynamo.utils import counters
 from torch._higher_order_ops.flex_gemm import _PRESERVE_FLEX_GEMM_GEMM_OP
 from torch._inductor.constant_folding import ConstantFolder
 from torch._inductor.fx_passes.dedupe_symint_uses import _SymHashingDict
-from torch._inductor.fx_utils import get_mutated_storages, get_node_storage
+from torch._inductor.fx_utils import (
+    get_mutated_input_nodes,
+    get_mutated_storages,
+    get_node_storage,
+)
 from torch._inductor.utils import get_gpu_type
 from torch._library.utils import zip_schema
 from torch.fx.experimental.symbolic_shapes import (
@@ -149,12 +153,48 @@ def remove_no_ops(
         mm_targets = (aten.mm.default, aten.bmm.default, aten.addmm.default)
         mutated_storages = get_mutated_storages(gm)
 
+        def replacement_is_mutated(replacement):
+            storage = get_node_storage(replacement)
+            if storage is not None and storage in mutated_storages:
+                return True
+
+            aliases = OrderedSet([replacement])
+            worklist = [replacement]
+            while worklist:
+                alias = worklist.pop()
+                for user in alias.users:
+                    if alias in get_mutated_input_nodes(user):
+                        return True
+                    target = user.target
+                    if not isinstance(target, torch._ops.OpOverload):
+                        continue
+                    return_aliases = OrderedSet().union(
+                        *(
+                            ret.alias_info.after_set
+                            for ret in target._schema.returns
+                            if ret.alias_info is not None
+                        )
+                    )
+                    for schema_arg, arg in zip_schema(
+                        target._schema, user.args, user.kwargs
+                    ):
+                        if (
+                            alias in pytree.tree_leaves(arg)
+                            and schema_arg.alias_info is not None
+                            and schema_arg.alias_info.after_set & return_aliases
+                            and user not in aliases
+                        ):
+                            aliases.add(user)
+                            worklist.append(user)
+                            break
+            return False
+
         def can_fold_identity(node, replacement):
             if not isinstance(replacement, torch.fx.Node) or not same_metadata(
                 node, replacement
             ):
                 return False
-            if get_node_storage(replacement) in mutated_storages:
+            if replacement_is_mutated(replacement):
                 return False
             sole_user = next(iter(node.users), None) if len(node.users) == 1 else None
             return (
