@@ -15,20 +15,14 @@ from torch._dynamo.utils import counters
 from torch._higher_order_ops.flex_gemm import _PRESERVE_FLEX_GEMM_GEMM_OP
 from torch._inductor.constant_folding import ConstantFolder
 from torch._inductor.fx_passes.dedupe_symint_uses import _SymHashingDict
-from torch._inductor.fx_utils import (
-    get_mutated_input_nodes,
-    get_mutated_storages,
-    get_node_storage,
-)
+from torch._inductor.fx_utils import get_node_storage
 from torch._inductor.utils import get_gpu_type
 from torch._library.utils import zip_schema
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     guard_or_true,
     statically_known_true,
-    sym_eq,
 )
-from torch.fx.passes.reinplace import _is_view_op
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._ordered_set import OrderedSet
 
@@ -103,411 +97,32 @@ def remove_no_ops(
     ones: OrderedSet[torch.fx.Node],
 ):
     """
-    Removes operations that are essentially no-ops e.g. (+ 0, - 0, * 1, / 1)
+    Materialize meta tensor outputs without folding allocating arithmetic ops.
     """
     with torch.utils._python_dispatch._disable_current_modes():
         graph = gm.graph
+        for output_node in graph.find_nodes(op="output"):
+            had_meta_return = False
 
-        def matches_identity(arg, known, scalar):
-            return (isinstance(arg, torch.fx.Node) and arg in known) or (
-                isinstance(arg, (int, float)) and arg == scalar
-            )
-
-        def identity_replacement_index(node):
-            if len(node.args) != 2:
-                return None
-            left, right = node.args
-            if node.target in (aten.add.Tensor, aten.sub.Tensor):
-                if node.kwargs.get("alpha", 1) != 1:
-                    return None
-                matches = functools.partial(matches_identity, known=zeros, scalar=0)
-            else:
-                matches = functools.partial(matches_identity, known=ones, scalar=1)
-
-            if node.target in (aten.sub.Tensor, aten.div.Tensor):
-                return 0 if matches(right) else None
-            if not (matches(left) or matches(right)):
-                return None
-            index = 1 if matches(left) else 0
-            if node.target is aten.add.Tensor:
-                replacement = node.args[index]
-                if isinstance(replacement, torch.fx.Node):
-                    val = replacement.meta.get("val")
-                    if isinstance(val, torch.Tensor) and val.is_conj():
-                        return None
-            return index
-
-        def materialize_meta_outputs():
-            # meta tensors returned from the graph have no data and can be replaced with empty_strided
-            for output_node in graph.find_nodes(op="output"):
-                had_meta_return = False
-
-                def visit(n):
-                    nonlocal had_meta_return
-                    val = n.meta.get("val")
-                    if isinstance(val, torch.Tensor) and val.device.type == "meta":
-                        with graph.inserting_before(output_node):
-                            # size/stride may be symbolic under dynamic shapes;
-                            # materialize them so we never pass raw SymInts as args.
-                            # Use materialize_symints (roots backed sizes on input
-                            # placeholders) rather than create_size_node(n, d), which
-                            # would query `n` and pin it alive, blocking the
-                            # eliminate_dead_code() that removes this meta tensor.
-                            size = graph.materialize_symints(val.size())
-                            stride = graph.materialize_symints(val.stride())
-                            n.replace_all_uses_with(
-                                graph.call_function(
-                                    torch.ops.aten.empty_strided.default,
-                                    args=(size, stride),
-                                    kwargs={"dtype": val.dtype, "device": val.device},
-                                )
+            def visit(n):
+                nonlocal had_meta_return
+                val = n.meta.get("val")
+                if isinstance(val, torch.Tensor) and val.device.type == "meta":
+                    with graph.inserting_before(output_node):
+                        size = graph.materialize_symints(val.size())
+                        stride = graph.materialize_symints(val.stride())
+                        n.replace_all_uses_with(
+                            graph.call_function(
+                                torch.ops.aten.empty_strided.default,
+                                args=(size, stride),
+                                kwargs={"dtype": val.dtype, "device": val.device},
                             )
-                        had_meta_return = True
-
-                torch.fx.map_arg(output_node.args, visit)
-                if had_meta_return:
-                    graph.eliminate_dead_code()
-
-        # Match once, in the original per-target pass order, and reuse the
-        # candidates after constructing the allocation and alias indexes.
-        candidates = [
-            (node, index)
-            for target in (
-                aten.add.Tensor,
-                aten.sub.Tensor,
-                aten.mul.Tensor,
-                aten.div.Tensor,
-            )
-            for node in graph.find_nodes(op="call_function", target=target)
-            if (index := identity_replacement_index(node)) is not None
-        ]
-        if not candidates:
-            materialize_meta_outputs()
-            return
-
-        mutated_storages = get_mutated_storages(gm)
-        storages = {node: get_node_storage(node) for node in graph.nodes}
-        external_storages = OrderedSet(
-            storage
-            for node, storage in storages.items()
-            if node.op in ("placeholder", "get_attr") and storage is not None
-        )
-
-        def fake_tensors_eq(
-            t1,
-            t2,
-            fields=("shape", "dtype", "device"),
-        ):
-            if any(not isinstance(t, torch.Tensor) for t in (t1, t2)):
-                return False
-            if t1.layout != t2.layout:
-                return False
-            for field in fields:
-                v1 = getattr(t1, field)
-                v2 = getattr(t2, field)
-                if field == "shape":
-                    # Shapes may contain unbacked SymInts; tuple `!=` would
-                    # force a guard. Conservatively treat unknown as "not equal".
-                    if not guard_or_false(sym_eq(v1, v2)):
-                        return False
-                elif v1 != v2:
-                    return False
-            return True
-
-        def first_tensor_input(node):
-            if isinstance(node.target, torch._ops.OpOverload):
-                first_arg = next(
-                    iter(zip_schema(node.target._schema, node.args, node.kwargs)), None
-                )
-                if first_arg is not None and isinstance(first_arg[1], torch.fx.Node):
-                    return first_arg[1]
-            return None
-
-        def is_view_target(target):
-            # These share storage despite omitting schema alias metadata.
-            return target in (
-                aten._unsafe_view.default,
-                aten.data.default,
-                aten.lift.default,
-            ) or (_is_view_op(target) is True)
-
-        def alias_base(node):
-            if is_view_target(node.target):
-                return first_tensor_input(node)
-            if node.target is operator.getitem and node.args:
-                base = node.args[0]
-                if isinstance(base, torch.fx.Node) and is_view_target(base.target):
-                    return base
-            return None
-
-        alias_roots: dict[torch.fx.Node, torch.fx.Node] = {}
-        replacement_roots: dict[torch.fx.Node, torch.fx.Node] = {}
-
-        def alias_root(node):
-            path: OrderedSet[torch.fx.Node] = OrderedSet()
-            while (
-                node not in path
-                and node not in alias_roots
-                and node not in replacement_roots
-            ):
-                path.add(node)
-                if (base := alias_base(node)) is None:
-                    break
-                node = base
-            node = alias_roots.get(node, replacement_roots.get(node, node))
-            for part in path:
-                alias_roots[part] = node
-            return node
-
-        mutated_roots: OrderedSet[torch.fx.Node] = OrderedSet()
-        for current in graph.nodes:
-            if storages[current] in mutated_storages:
-                mutated_roots.add(alias_root(current))
-            for written in get_mutated_input_nodes(current):
-                mutated_roots.add(alias_root(written))
-
-        # Some real-mode traces normalize an unresolved bit in fake metadata;
-        # the view-producing op still reveals that the replacement can carry it.
-        unresolved_bit_views: OrderedSet[torch.fx.Node] = OrderedSet()
-        for current in graph.nodes:
-            if current.target in (aten._conj.default, aten._neg_view.default) or (
-                (base := alias_base(current)) is not None
-                and base in unresolved_bit_views
-            ):
-                unresolved_bit_views.add(current)
-
-        # Real tracing may normalize a slice's fake storage_offset to zero.
-        # Explicit layout observers can still observe the original offset.
-        layout_observers = (
-            aten.as_strided.default,
-            aten.as_strided_copy.default,
-            aten.as_strided_scatter.default,
-            aten._reshape_alias.default,
-            aten._unsafe_view.default,
-            aten._debug_has_internal_overlap.default,
-            aten._assert_tensor_metadata.default,
-            aten.is_contiguous.default,
-            aten.is_contiguous.memory_format,
-            aten.is_non_overlapping_and_dense.default,
-            aten.is_strides_like_format.default,
-            aten.storage_offset.default,
-            aten.stride.default,
-            aten.stride.int,
-            aten.sym_is_contiguous.default,
-            aten.sym_storage_offset.default,
-            aten.sym_stride.default,
-            aten.sym_stride.int,
-            aten.view.default,
-            aten.view_as_complex.default,
-            aten.view_as_complex_copy.default,
-            aten.view.dtype,
-            aten.view_copy.dtype,
-        )
-        # TensorImpl state, storage identity, and transfers are observable
-        # through views, but not through an allocating operation. Follow only
-        # view provenance to avoid retaining unrelated upstream allocations.
-        # Opaque calls lack a known value-only contract, so treat their tensor
-        # arguments as allocation-sensitive rather than enumerating every
-        # native or custom identity observer and mutator.
-        allocation_sensitive_roots: OrderedSet[torch.fx.Node] = OrderedSet()
-        for current in graph.nodes:
-            target = current.target
-            is_value_only_op = isinstance(
-                target, torch._ops.OpOverload
-            ) and target.namespace in ("aten", "prims")
-            if target in layout_observers:
-                observed_inputs = [first_tensor_input(current)]
-            elif target in (
-                aten.is_set_to.default,
-                aten.is_pinned.default,
-                aten.is_conj.default,
-                aten.is_neg.default,
-                aten.is_inference.default,
-                aten.is_leaf.default,
-                aten._is_zerotensor.default,
-                aten.retains_grad.default,
-                aten.output_nr.default,
-                aten._version.default,
-                aten._has_same_storage_numel.default,
-            ):
-                observed_inputs = current.all_input_nodes
-            elif current.op in ("call_method", "call_module") or (
-                current.op == "call_function"
-                and target is not operator.getitem
-                and not is_value_only_op
-            ):
-                observed_inputs = current.all_input_nodes
-            elif isinstance(target, torch._ops.OpOverload) and target in (
-                aten.set.source_Tensor,
-                aten.set.source_Tensor_out,
-                aten.set_.source_Tensor,
-                aten.set_.source_Tensor_storage_offset,
-                aten.set_data.default,
-                aten.shallow_copy_data_.default,
-            ):
-                observed_inputs = [
-                    value
-                    for schema_arg, value in zip_schema(
-                        target._schema, current.args, current.kwargs
-                    )
-                    if schema_arg.name in ("source", "new_data")
-                    and isinstance(value, torch.fx.Node)
-                ]
-            elif (
-                isinstance(target, torch._ops.OpOverload)
-                and target is aten._new_zeros_with_same_feature_meta.default
-            ):
-                # This allocation inherits the *storage capacity* of other,
-                # not only its visible shape and strides.
-                observed_inputs = [
-                    value
-                    for schema_arg, value in zip_schema(
-                        target._schema, current.args, current.kwargs
-                    )
-                    if schema_arg.name == "other" and isinstance(value, torch.fx.Node)
-                ]
-            else:
-                continue
-            for input_node in observed_inputs:
-                if isinstance(input_node, torch.fx.Node):
-                    allocation_sensitive_roots.add(alias_root(input_node))
-
-        output_roots: Counter[torch.fx.Node] = Counter()
-        output_storages: Counter[int] = Counter()
-        output_pairs: Counter[tuple[torch.fx.Node, int | None]] = Counter()
-        output_index_dirty = True
-
-        def changes_output_aliases(node, replacement):
-            nonlocal output_index_dirty
-            if output_index_dirty:
-                alias_roots.clear()
-                output_roots.clear()
-                output_storages.clear()
-                output_pairs.clear()
-                for result in graph.find_nodes(op="output"):
-                    for leaf in pytree.tree_leaves(result.args):
-                        if isinstance(leaf, torch.fx.Node):
-                            root = alias_root(leaf)
-                            storage = storages.get(leaf)
-                            output_roots[root] += 1
-                            output_pairs[root, storage] += 1
-                            if storage is not None:
-                                output_storages[storage] += 1
-                output_index_dirty = False
-
-            node_storage = storages.get(node)
-            if not output_roots[node] and (
-                node_storage is None or not output_storages[node_storage]
-            ):
-                return False
-            root = alias_root(replacement)
-            if root.op in ("placeholder", "get_attr"):
-                return True
-            replacement_storage = storages.get(replacement)
-            if replacement_storage in external_storages:
-                return True
-
-            # Count aliased outputs other than the ones already escaping from node.
-            if root is not node and output_roots[root] > (
-                output_pairs[root, node_storage] if node_storage is not None else 0
-            ):
-                return True
-            return (
-                replacement_storage is not None
-                and replacement_storage != node_storage
-                and output_storages[replacement_storage]
-                > output_pairs[node, replacement_storage]
-            )
-
-        def is_mutated(n):
-            return alias_root(n) in mutated_roots
-
-        def update_direct_output_index(node, replacement, node_storage):
-            replacement_root = alias_root(replacement)
-            replacement_storage = storages.get(replacement)
-            output_roots[node] -= 1
-            output_roots[replacement_root] += 1
-            output_pairs[node, node_storage] -= 1
-            output_pairs[replacement_root, replacement_storage] += 1
-            output_storages[node_storage] -= 1
-            if replacement_storage is not None:
-                output_storages[replacement_storage] += 1
-
-        def replace_no_op(node, replace_input_index):
-            nonlocal output_index_dirty
-            replacement = node.args[replace_input_index]
-            synthesized_replacement = False
-
-            # https://github.com/pytorch/pytorch/issues/86128 causes
-            # non-Tensor inputs even for ops with only Tensor inputs.
-            # TODO - decompose/type promote to avoid this
-            if not all(isinstance(arg, torch.fx.Node) for arg in node.args):
-                if all(
-                    isinstance(arg, (int, float)) for arg in node.args
-                ) or not isinstance(replacement, torch.fx.Node):
-                    return
-
-            if not fake_tensors_eq(node.meta["val"], replacement.meta["val"]):
-                if fake_tensors_eq(
-                    node.meta["val"],
-                    replacement.meta["val"],
-                    (
-                        "shape",
-                        "device",
-                    ),
-                ):
-                    with graph.inserting_after(node):
-                        replacement = graph.call_function(
-                            torch.ops.prims.convert_element_type.default,
-                            args=(replacement, node.meta["val"].dtype),
                         )
-                        synthesized_replacement = True
-                else:
-                    return
+                    had_meta_return = True
 
-            # https://github.com/pytorch/pytorch/issues/174187
-            # Retain the allocation when a write or output alias would become visible.
-            if not synthesized_replacement and (
-                is_mutated(replacement)
-                or is_mutated(node)
-                or changes_output_aliases(node, replacement)
-                or replacement in unresolved_bit_views
-                or alias_root(node) in allocation_sensitive_roots
-            ):
-                return
-
-            node_storage = storages.get(node)
-            if synthesized_replacement:
-                replacement_roots[replacement] = alias_root(node)
-                storages[replacement] = node_storage
-            # A unique, directly returned allocation needs only one index
-            # update; rescanning all outputs for each such fold is quadratic.
-            single_direct_output = (
-                not output_index_dirty
-                and node_storage is not None
-                and output_roots[node] == 1
-                and output_storages[node_storage] == 1
-                and any(user.op == "output" for user in node.users)
-                and not any(alias_base(user) is node for user in node.users)
-            )
-            node.replace_all_uses_with(replacement)
-            diagnostic_meta = node.meta.copy()
-            if not synthesized_replacement:
-                diagnostic_meta.pop("val", None)
-                diagnostic_meta.pop("tensor_meta", None)
-            replacement.meta.update(diagnostic_meta)
-            graph.erase_node(node)
-            if single_direct_output:
-                update_direct_output_index(node, replacement, node_storage)
-            elif output_roots[node] or (
-                node_storage is not None and output_storages[node_storage]
-            ):
-                output_index_dirty = True
-
-        for node, index in candidates:
-            replace_no_op(node, index)
-
-        materialize_meta_outputs()
+            torch.fx.map_arg(output_node.args, visit)
+            if had_meta_return:
+                graph.eliminate_dead_code()
 
 
 def remove_redundant_views(gm: torch.fx.GraphModule):
