@@ -249,8 +249,6 @@ def remove_no_ops(
                 node, replacement
             ):
                 return False
-            if replacement_is_mutated(replacement):
-                return False
             sole_user = next(iter(node.users), None) if len(node.users) == 1 else None
             value_consumer = False
             if sole_user is not None and isinstance(
@@ -266,7 +264,7 @@ def remove_no_ops(
                         or torch.Tag.reduction in target.tags
                     )
                 )
-            return (
+            eligible = (
                 replacement.op == "call_function"
                 and replacement.target in mm_targets
                 and len(replacement.users) == 1
@@ -275,6 +273,7 @@ def remove_no_ops(
                 and sole_user.op == "call_function"
                 and (sole_user.target in mm_targets or value_consumer)
             )
+            return eligible and not replacement_is_mutated(replacement)
 
         for target in (
             aten.add.Tensor,
