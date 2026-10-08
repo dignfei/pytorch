@@ -23093,6 +23093,26 @@ class NoOpFoldingTests(InductorTestCase):
         )
         self.assertEqual(gm(x), fn(x))
 
+    def test_noop_fold_preserves_mixed_sparse_layout(self):
+        def fn(zero, x):
+            return (zero + x).sin()
+
+        zero = torch.zeros(2, 2)
+        x = torch.sparse_coo_tensor(
+            torch.tensor([[0, 1], [0, 1]]), torch.tensor([1.0, 2.0]), (2, 2)
+        ).coalesce()
+        gm = make_fx(fn, tracing_mode="real")(zero, x)
+        zero_node, x_node = gm.graph.find_nodes(op="placeholder")
+        zero_node.meta["val"] = zero
+        x_node.meta["val"] = x
+        self.assertEqual(gm(zero, x), fn(zero, x))
+        remove_no_ops(gm, OrderedSet([zero_node]), OrderedSet())
+        self.assertEqual(
+            len(gm.graph.find_nodes(op="call_function", target=aten.add.Tensor)), 1
+        )
+        gm.recompile()
+        self.assertEqual(gm(zero, x), fn(zero, x))
+
     def check_tensor_observer(self, x, observer, value_kind, expected):
         def fn(x):
             value = x * 1.0

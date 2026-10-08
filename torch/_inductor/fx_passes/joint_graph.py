@@ -200,6 +200,8 @@ def remove_no_ops(
         ):
             if any(not isinstance(t, torch.Tensor) for t in (t1, t2)):
                 return False
+            if t1.layout != t2.layout:
+                return False
             for field in fields:
                 v1 = getattr(t1, field)
                 v2 = getattr(t2, field)
