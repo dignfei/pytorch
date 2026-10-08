@@ -23102,13 +23102,10 @@ class NoOpFoldingTests(InductorTestCase):
         output = gm.graph.find_nodes(op="output")[0]
         source = output.args[0]
         with gm.graph.inserting_before(output):
-
-            def observe(node):
-                if isinstance(observer, str):
-                    return gm.graph.call_method(observer, args=(node,))
-                return gm.graph.call_function(observer, args=(node,))
-
-            result = observe(source)
+            if isinstance(observer, str):
+                result = gm.graph.call_method(observer, args=(source,))
+            else:
+                result = gm.graph.call_function(observer, args=(source,))
         output.args = (result,)
         gm.graph.lint()
         gm.recompile()
