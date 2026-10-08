@@ -23505,6 +23505,21 @@ class NoOpFoldingTests(InductorTestCase):
         self.fold_and_check_mul(gm)
         self.assertEqual(gm(x.clone()), expected)
 
+    def test_noop_fold_preserves_chained_conversion_across_output_reindex(self):
+        def fn(x, y):
+            value = x * 1.0
+            unrelated = (y * 1.0).sin()
+            result = value * 1.0
+            value.add_(2)
+            return result, unrelated
+
+        x = torch.tensor([1, 2], dtype=torch.int64)
+        y = torch.tensor([3.0, 4.0])
+        gm = make_fx(fn, tracing_mode="real")(x, y)
+        expected = fn(x.clone(), y)
+        self.fold_and_check_mul(gm)
+        self.assertEqual(gm(x.clone(), y), expected)
+
     def test_noop_fold_preserves_direct_output_conversion(self):
         def fn(x):
             return x * 1.0

@@ -239,15 +239,20 @@ def remove_no_ops(
             return None
 
         alias_roots: dict[torch.fx.Node, torch.fx.Node] = {}
+        replacement_roots: dict[torch.fx.Node, torch.fx.Node] = {}
 
         def alias_root(node):
             path: OrderedSet[torch.fx.Node] = OrderedSet()
-            while node not in path and node not in alias_roots:
+            while (
+                node not in path
+                and node not in alias_roots
+                and node not in replacement_roots
+            ):
                 path.add(node)
                 if (base := alias_base(node)) is None:
                     break
                 node = base
-            node = alias_roots.get(node, node)
+            node = alias_roots.get(node, replacement_roots.get(node, node))
             for part in path:
                 alias_roots[part] = node
             return node
@@ -471,7 +476,7 @@ def remove_no_ops(
 
             node_storage = storages.get(node)
             if synthesized_replacement:
-                alias_roots[replacement] = alias_root(node)
+                replacement_roots[replacement] = alias_root(node)
                 storages[replacement] = node_storage
             # A unique, directly returned allocation needs only one index
             # update; rescanning all outputs for each such fold is quadratic.
