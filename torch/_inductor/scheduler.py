@@ -9701,20 +9701,26 @@ class Scheduler:
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         candidate_nodes = (node1, node2)
-        for candidate in candidate_nodes:
-            for mutating_node in candidate.get_nodes():
+        candidate_leaves = tuple(tuple(node.get_nodes()) for node in candidate_nodes)
+        for mutation_leaves in candidate_leaves:
+            for mutating_node in mutation_leaves:
                 for weak_dep in mutating_node._pruned_weak_deps:
                     reading_candidate = next(
                         (
-                            node
-                            for node in candidate_nodes
-                            if weak_dep.name in node.get_buffer_names()
+                            (node, leaves)
+                            for node, leaves in zip(
+                                candidate_nodes, candidate_leaves, strict=True
+                            )
+                            if any(
+                                weak_dep.name in leaf.get_buffer_names()
+                                for leaf in leaves
+                            )
                         ),
                         None,
                     )
                     if reading_candidate is not None and not self.fusable_weak_dep(
                         weak_dep,
-                        reading_candidate,
+                        reading_candidate[0],
                         mutating_node,
                     ):
                         return False

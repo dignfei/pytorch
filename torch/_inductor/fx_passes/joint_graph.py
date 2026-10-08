@@ -470,6 +470,9 @@ def remove_no_ops(
                 return
 
             node_storage = storages.get(node)
+            if synthesized_replacement:
+                alias_roots[replacement] = alias_root(node)
+                storages[replacement] = node_storage
             # A unique, directly returned allocation needs only one index
             # update; rescanning all outputs for each such fold is quadratic.
             single_direct_output = (

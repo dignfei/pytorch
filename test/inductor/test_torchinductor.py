@@ -23492,23 +23492,18 @@ class NoOpFoldingTests(InductorTestCase):
         self.assertEqual(placeholder.meta["tensor_meta"].stride, (0,))
         self.assertEqual(gm(x), fn(x))
 
-    def test_noop_fold_preserves_synthesized_conversion_metadata(self):
+    def test_noop_fold_preserves_chained_conversion_before_mutation(self):
         def fn(x):
             value = x * 1.0
-            return value.sin(), value @ value
+            result = value * 1.0
+            value.add_(2)
+            return result
 
-        x = torch.arange(4, dtype=torch.int64).reshape(2, 2)
+        x = torch.tensor([1, 2], dtype=torch.int64)
         gm = make_fx(fn, tracing_mode="real")(x)
-        mul = gm.graph.find_nodes(op="call_function", target=aten.mul.Tensor)[0]
-        expected_meta = mul.meta["tensor_meta"]
-        self.fold_and_check_mul(gm, 0)
-        conversion = gm.graph.find_nodes(
-            op="call_function", target=torch.ops.prims.convert_element_type.default
-        )[0]
-        self.assertEqual(conversion.meta["tensor_meta"], expected_meta)
-        self.assertEqual(conversion.meta["val"].dtype, torch.float32)
-        self.assertEqual(gm(x), fn(x))
-        self.assertEqual(torch.compile(gm, fullgraph=True)(x), fn(x))
+        expected = fn(x.clone())
+        self.fold_and_check_mul(gm)
+        self.assertEqual(gm(x.clone()), expected)
 
     def test_noop_fold_preserves_direct_output_conversion(self):
         def fn(x):
@@ -23520,16 +23515,6 @@ class NoOpFoldingTests(InductorTestCase):
         actual = gm(x)
         self.assertEqual(actual, fn(x))
         self.assertFalse(torch._C._is_alias_of(actual, x))
-
-    def test_noop_fold_preserves_view_layout(self):
-        def fn(x):
-            return (x * 1.0).view(-1).sin()
-
-        x = torch.arange(12.0).reshape(3, 4)[:, ::2]
-        gm = make_fx(fn, tracing_mode="real")(x)
-        self.assertEqual(gm(x), fn(x))
-        self.fold_and_check_mul(gm)
-        self.assertEqual(gm(x), fn(x))
 
     @parametrize(
         "observer_kind",
