@@ -22,6 +22,7 @@ from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     guard_or_true,
     statically_known_true,
+    sym_eq,
 )
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._ordered_set import OrderedSet
@@ -97,10 +98,78 @@ def remove_no_ops(
     ones: OrderedSet[torch.fx.Node],
 ):
     """
-    Materialize meta tensor outputs without folding allocating arithmetic ops.
+    Fold identities over an otherwise unobserved matrix-multiply allocation.
     """
     with torch.utils._python_dispatch._disable_current_modes():
         graph = gm.graph
+
+        def matches_identity(arg, known, scalar):
+            return (isinstance(arg, torch.fx.Node) and arg in known) or (
+                isinstance(arg, (int, float)) and arg == scalar
+            )
+
+        def identity_replacement(node):
+            if len(node.args) != 2:
+                return None
+            left, right = node.args
+            if node.target in (aten.add.Tensor, aten.sub.Tensor):
+                if node.kwargs.get("alpha", 1) != 1:
+                    return None
+                matches = functools.partial(matches_identity, known=zeros, scalar=0)
+            else:
+                matches = functools.partial(matches_identity, known=ones, scalar=1)
+
+            if node.target in (aten.sub.Tensor, aten.div.Tensor):
+                return left if matches(right) else None
+            if not (matches(left) or matches(right)):
+                return None
+            return right if matches(left) else left
+
+        def same_metadata(node, replacement):
+            node_val = node.meta.get("val")
+            replacement_val = replacement.meta.get("val")
+            if not isinstance(node_val, torch.Tensor) or not isinstance(
+                replacement_val, torch.Tensor
+            ):
+                return False
+            if (
+                node_val.dtype != replacement_val.dtype
+                or node_val.device != replacement_val.device
+                or node_val.layout != replacement_val.layout
+                or not guard_or_false(sym_eq(node_val.shape, replacement_val.shape))
+            ):
+                return False
+            return node_val.layout != torch.strided or (
+                guard_or_false(sym_eq(node_val.stride(), replacement_val.stride()))
+                and guard_or_false(
+                    sym_eq(node_val.storage_offset(), replacement_val.storage_offset())
+                )
+            )
+
+        def can_reuse_mm_allocation(node, replacement):
+            return (
+                isinstance(replacement, torch.fx.Node)
+                and replacement.op == "call_function"
+                and replacement.target
+                in (aten.mm.default, aten.bmm.default, aten.addmm.default)
+                and len(replacement.users) == 1
+                and node in replacement.users
+                and same_metadata(node, replacement)
+            )
+
+        for target in (
+            aten.add.Tensor,
+            aten.sub.Tensor,
+            aten.mul.Tensor,
+            aten.div.Tensor,
+        ):
+            for node in list(graph.find_nodes(op="call_function", target=target)):
+                replacement = identity_replacement(node)
+                if not can_reuse_mm_allocation(node, replacement):
+                    continue
+                node.replace_all_uses_with(replacement)
+                graph.erase_node(node)
+
         for output_node in graph.find_nodes(op="output"):
             had_meta_return = False
 
