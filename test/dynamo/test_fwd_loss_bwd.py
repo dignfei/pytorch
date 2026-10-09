@@ -162,6 +162,7 @@ class <lambda>(torch.nn.Module):
             OrderedDict,
             functools.partial(defaultdict, None),
             MappingProxyType,
+            *([torch._frozendict] if torch._has_frozendict else []),
         ],
     )
     def test_autograd_grad_dict_inputs(self, mapping_cls):
@@ -363,6 +364,7 @@ class <lambda>(torch.nn.Module):
             OrderedDict,
             functools.partial(defaultdict, None),
             MappingProxyType,
+            *([torch._frozendict] if torch._has_frozendict else []),
         ],
     )
     def test_backward_dict_inputs(self, mapping_cls):
