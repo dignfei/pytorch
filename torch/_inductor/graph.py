@@ -109,6 +109,7 @@ from .runtime import autotune_cache
 from .runtime.autotune_cache import AutotuneCacheBundler
 from .sizevars import SizeVarAllocator
 from .utils import (
+    convert_shape_to_inductor,
     gather_origins,
     get_cloned_parameter_buffer_name,
     get_donated_idxs,
@@ -421,6 +422,10 @@ class GraphLowering(torch.fx.Interpreter):
         fx_wrapper: bool = False,
         get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] | None = None,
     ) -> None:
+        from .fx_passes.as_strided import canonicalize_as_strided
+
+        # Interpreter caches last uses, so finish changing edges before initialization.
+        canonicalize_as_strided(gm)
         super().__init__(gm)
         self.get_decomp_fn = get_decomp_fn
         self.example_inputs = example_inputs
@@ -2099,8 +2104,19 @@ class GraphLowering(torch.fx.Interpreter):
             is_input_for_as_strided = any(
                 user.target in as_strided_ops for user in n.users
             )
+            # Keep dtype reinterpretations on their existing layout handling path.
+            is_as_strided_input = n.target is not aten.view.dtype and any(
+                user.target in (aten.as_strided.default, aten.as_strided_copy.default)
+                for user in n.users
+            )
 
-            if n.meta.get("inductor_realize_to_strides", False) and isinstance(
+            if is_as_strided_input and isinstance(result, TensorBox):
+                # Fix the base before another view or consumer freezes its layout.
+                result.realize()
+                result = ir.ExternKernel.require_exact_strides(
+                    result, convert_shape_to_inductor(n.meta["val"].stride())
+                )
+            elif n.meta.get("inductor_realize_to_strides", False) and isinstance(
                 result, TensorBox
             ):
                 result.realize()
@@ -2117,8 +2133,10 @@ class GraphLowering(torch.fx.Interpreter):
                 # Realize so that outputs are correctly aliased
                 result.realize()
 
-            if (is_output or is_input_for_as_strided) and isinstance(
-                n.meta.get("val"), torch.Tensor
+            if (
+                not is_as_strided_input
+                and (is_output or is_input_for_as_strided)
+                and isinstance(n.meta.get("val"), torch.Tensor)
             ):
                 if is_user_visible:
                     strides = self.user_visible_output_strides.get(n)
@@ -2209,14 +2227,15 @@ class GraphLowering(torch.fx.Interpreter):
                             ]
                             if torch._C.has_mkl:
                                 need_fixed_layout += [torch.ops.mkl._mkl_linear.default]
-                        if user.target in need_fixed_layout:
+                        if not is_as_strided_input and user.target in need_fixed_layout:
                             result = ir.ExternKernel.require_stride_order(
                                 result,
                                 ir.get_stride_order(n.meta["val"].stride()),
                                 allow_padding=True,
                             )
                         if (
-                            user.target in need_fixed_channels_last_layout
+                            not is_as_strided_input
+                            and user.target in need_fixed_channels_last_layout
                             and n is user.args[0]
                         ):
                             result = ir.ExternKernel.require_stride_order(
