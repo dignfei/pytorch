@@ -1,4 +1,5 @@
 #include <ATen/core/dispatch/OperatorOptions.h>
+#include <ATen/native/EmbeddingBag.h>
 #include <c10/core/ScalarType.h>
 #include <gtest/gtest.h>
 #include <torch/csrc/jit/ir/alias_analysis.h>
@@ -661,6 +662,80 @@ TEST(StaticRuntime, EmbeddingBagWithMixedInt32Int64Input) {
   std::vector<IValue> args{weight, input, offset};
   testStaticRuntime(embedding_bag_default, args);
 }
+
+TEST(StaticRuntime, EmbeddingBagHalfTypesWithAndWithoutWeights) {
+  const std::string embedding_bag = R"JIT(
+    def forward(self, weight: Tensor, indices: Tensor, offsets: Tensor, per_sample_weights: Tensor):
+        unweighted, _, _, _ = torch.embedding_bag(weight, indices, offsets)
+        weighted, _, _, _ = torch.embedding_bag(
+            weight, indices, offsets, False, 0, False, per_sample_weights)
+        return unweighted.clone(), weighted.clone()
+  )JIT";
+
+  const auto indices = torch::tensor({0, 2, 1, 3}, at::ScalarType::Long);
+  const auto offsets = torch::tensor({0, 2}, at::ScalarType::Long);
+  const auto make_args = [&](const at::ScalarType dtype) {
+    const auto options = torch::TensorOptions().dtype(dtype);
+    const auto weight = torch::arange(1, 33, options).reshape({4, 8}) / 8;
+    const auto per_sample_weights =
+        torch::tensor({0.5, 1.5, 2.0, 0.25}, options);
+    return std::vector<IValue>{
+        weight, indices, offsets, per_sample_weights};
+  };
+
+  testStaticRuntime(embedding_bag, make_args(at::ScalarType::Half));
+  testStaticRuntime(embedding_bag, make_args(at::ScalarType::BFloat16));
+}
+
+#ifdef USE_FBGEMM
+TEST(StaticRuntime, EmbeddingBagHalfTypesWithKernelCache) {
+  const auto indices = torch::tensor({0, 2, 1, 3}, at::ScalarType::Long);
+  const auto offsets = torch::tensor({0, 2}, at::ScalarType::Long);
+  const auto run = [&](const at::Tensor& weight,
+                       const std::optional<at::Tensor>& per_sample_weights,
+                       at::native::_EmbeddingBagKernelCache* cache) {
+    auto output = at::empty(
+        {offsets.size(0), weight.size(1)}, weight.options());
+    auto offset2bag = at::empty({0}, offsets.options());
+    auto bag_size = at::empty(offsets.sizes(), offsets.options());
+    at::native::_embedding_bag_cpu_out(
+        output,
+        offset2bag,
+        bag_size,
+        nullptr,
+        weight,
+        indices,
+        offsets,
+        false,
+        static_cast<int64_t>(at::native::EmbeddingBagMode::SUM),
+        false,
+        per_sample_weights,
+        false,
+        std::nullopt,
+        cache);
+    return output;
+  };
+
+  for (const auto dtype :
+       {at::ScalarType::Half, at::ScalarType::BFloat16}) {
+    const auto options = torch::TensorOptions().dtype(dtype);
+    const auto weight = torch::arange(1, 33, options).reshape({4, 8}) / 8;
+    const auto sample_weights =
+        torch::tensor({0.5, 1.5, 2.0, 0.25}, options);
+    for (const auto& per_sample_weights :
+         {std::optional<at::Tensor>{},
+          std::optional<at::Tensor>{sample_weights}}) {
+      const auto expected = run(weight, per_sample_weights, nullptr);
+      for (const auto block_size :
+           {std::optional<int64_t>{weight.size(1)},
+            std::optional<int64_t>{}}) {
+        at::native::_EmbeddingBagKernelCache cache(block_size);
+        EXPECT_TRUE(expected.equal(run(weight, per_sample_weights, &cache)));
+      }
+    }
+  }
+}
+#endif
 
 TEST(StaticRuntime, LayerNorm) {
   const std::string layer_norm_with_weights = R"JIT(
