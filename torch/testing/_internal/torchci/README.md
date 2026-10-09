@@ -88,12 +88,20 @@ Readers compare `schema_version` exactly. While the format is 0.x, a breaking
 change bumps the minor version (`"0.1"` to `"0.2"`); additive changes keep it.
 `"1.0"` will be the first stable format.
 
+## Enablement
+
+Off by default. `test/run_test.py` and tests using `common_utils.run_tests`
+accept `--save-torchci-reports [DIR]` and `--no-save-torchci-reports`. A test
+file's reports are `<DIR>/<file>-<report_uuid>.report.jsonl`, with path
+separators in `<file>` replaced by dots (`distributed.test_c10d_nccl`).
+`run_test.py` defaults to `test/torchci-reports` and resolves a relative `DIR`
+under `test/`; `run_tests` defaults to `torchci-reports` in the cwd.
+
 ## Local check
 
-With PyTorch built from this branch, from `test/`:
+With PyTorch built from this branch, from the repo root:
 
 ```bash
-python -m pytest test_type_info.py -p torch.testing._internal.torchci.plugin \
-    --torchci-report-prefix=/tmp/torchci-reports/test_type_info
-cat /tmp/torchci-reports/test_type_info-*.report.jsonl | python -m json.tool --json-lines
+python test/run_test.py -i test_type_info --save-torchci-reports
+cat test/torchci-reports/test_type_info-*.report.jsonl | python -m json.tool --json-lines
 ```
