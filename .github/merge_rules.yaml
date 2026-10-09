@@ -623,7 +623,6 @@
   - '*'
   approved_by:
   - aditvenk
-  - AmesingFlank
   - angelayi
   - anshul-si
   - aorenste
@@ -677,6 +676,7 @@
   - williamwen42
   - ydwu4
   - yushangdi
+  - zoranzhao
   mandatory_checks_name:
   - EasyCLA
   - Lint
