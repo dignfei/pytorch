@@ -1190,7 +1190,8 @@ def parse_cmd_line_args():
                         const=_get_test_report_path(),
                         default=_get_test_report_path() if IS_CI else None)
     parser.add_argument('--save-torchci-reports', nargs='?', type=str,
-                        const=TORCHCI_REPORTS_DIR, default=None)
+                        const=TORCHCI_REPORTS_DIR,
+                        default=TORCHCI_REPORTS_DIR if IS_CI else None)
     parser.add_argument('--no-save-torchci-reports', dest='save_torchci_reports',
                         action='store_const', const=None, default=argparse.SUPPRESS)
     parser.add_argument('--discover-tests', action='store_true')
@@ -1567,6 +1568,8 @@ def run_tests(argv=None):
             other_args += ['--save-xml', TEST_SAVE_XML]
         if TEST_SAVE_TORCHCI_REPORTS:
             other_args.append(f'--save-torchci-reports={TEST_SAVE_TORCHCI_REPORTS}')
+        else:
+            other_args.append('--no-save-torchci-reports')
         if HW_CLASSIFICATION is not None:
             other_args += ['--hw-classification'] + [req.name for req in HW_CLASSIFICATION]
 
