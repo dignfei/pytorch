@@ -784,6 +784,12 @@ std::tuple<Tensor, Tensor> _euclidean_dist_backward(
     const Tensor& x1,
     const Tensor& x2,
     const Tensor& res);
+Tensor _euclidean_dist_jvp(
+    const Tensor& x1,
+    const Tensor& x2,
+    const Tensor& x1_t,
+    const Tensor& x2_t,
+    const Tensor& res);
 std::tuple<Tensor, Tensor, Tensor, Tensor> _cdist_backward_backward(
     const Tensor& grad,
     const Tensor& grad_output,

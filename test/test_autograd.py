@@ -14486,6 +14486,73 @@ class TestAutogradDeviceType(TestCase):
         self.assertEqual(model.b.grad.device, torch.device("cpu"))
 
     @dtypes(torch.double)
+    @parametrize("tangent_inputs", [(True, False), (False, True), (True, True)])
+    @parametrize(
+        "case", ["unbatched", "broadcast", "coincident", "empty_rows", "empty_features"]
+    )
+    def test_euclidean_dist_forward_ad(self, device, dtype, tangent_inputs, case):
+        shapes = {
+            "unbatched": ((2, 3), (4, 3)),
+            "broadcast": ((2, 1, 2, 3), (1, 3, 4, 3)),
+            "coincident": ((2, 3), (4, 3)),
+            "empty_rows": ((0, 3), (4, 3)),
+            "empty_features": ((2, 0), (4, 0)),
+        }[case]
+        make = torch.zeros if case == "coincident" else torch.randn
+        inputs = tuple(
+            make(shape, device=device, dtype=dtype, requires_grad=True)
+            for shape in shapes
+        )
+        with fwAD.dual_level():
+            duals = tuple(
+                fwAD.make_dual(x, torch.randn_like(x)) if has_tangent else x
+                for x, has_tangent in zip(inputs, tangent_inputs)
+            )
+            actual = fwAD.unpack_dual(torch._euclidean_dist(*duals))
+            reference = torch.linalg.vector_norm(
+                duals[0].unsqueeze(-2) - duals[1].unsqueeze(-3), dim=-1
+            )
+            self.assertEqual(actual, fwAD.unpack_dual(reference))
+        if case == "coincident":
+            self.assertEqual(actual.tangent, torch.zeros_like(actual.primal))
+            grads = torch.autograd.grad(actual.tangent.sum(), inputs)
+            self.assertEqual(grads, tuple(torch.zeros_like(x) for x in inputs))
+
+    @dtypes(torch.double)
+    @parametrize("features", [0, 3])
+    def test_euclidean_dist_backward_zero(self, device, dtype, features):
+        x1 = torch.zeros(2, features, device=device, dtype=dtype, requires_grad=True)
+        x2 = torch.zeros(4, features, device=device, dtype=dtype, requires_grad=True)
+        grad_output = torch.randn(2, 4, device=device, dtype=dtype, requires_grad=True)
+        grads = torch.autograd.grad(
+            torch._euclidean_dist(x1, x2), (x1, x2), grad_output, create_graph=True
+        )
+        self.assertEqual(grads, (torch.zeros_like(x1), torch.zeros_like(x2)))
+        (grad_grad_output,) = torch.autograd.grad(
+            grads, grad_output, tuple(torch.ones_like(g) for g in grads)
+        )
+        self.assertEqual(grad_grad_output, torch.zeros_like(grad_output))
+
+    @dtypes(torch.double)
+    @parametrize("batched", [False, True])
+    def test_cdist_hessian(self, device, dtype, batched):
+        x1 = torch.randn((1, 2, 3) if batched else (2, 3), device=device, dtype=dtype)
+        x2 = torch.randn((2, 4, 3) if batched else (4, 3), device=device, dtype=dtype)
+
+        def fn(a, b):
+            return torch.cdist(a, b, p=2, compute_mode="use_mm_for_euclid_dist").sum()
+
+        def reference(a, b):
+            return torch.linalg.vector_norm(
+                a.unsqueeze(-2) - b.unsqueeze(-3), dim=-1
+            ).sum()
+
+        self.assertEqual(
+            torch.func.hessian(fn, argnums=(0, 1))(x1, x2),
+            torch.func.hessian(reference, argnums=(0, 1))(x1, x2),
+        )
+
+    @dtypes(torch.double)
     def test_cdist_gradgrad(self, device, dtype):
         # Second-order (double) backward for cdist / _cdist_backward. p < 1 is
         # excluded here because |diff|^(p-2) makes the second derivative too

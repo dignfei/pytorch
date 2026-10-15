@@ -2355,6 +2355,20 @@ def sample_inputs_block_diag(op_info, device, dtype, requires_grad, **kwargs):
             make_arg_non_complex = partial(make_tensor, dtype=non_complex_dtype, device=device, requires_grad=requires_grad)
             yield SampleInput(make_arg_non_complex(shape), args=tuple(make_arg(s) for s in other_shapes))
 
+def sample_inputs_euclidean_dist(op_info, device, dtype, requires_grad, **kwargs):
+    make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
+    for x1_shape, x2_shape in (
+        ((2, 3), (4, 3)),
+        ((2, 2, 3), (2, 4, 3)),
+        ((2, 1, 2, 3), (1, 3, 4, 3)),
+        ((0, 3), (4, 3)),
+        ((2, 3), (0, 3)),
+        ((0, 2, 3), (1, 4, 3)),
+        ((2, 0), (4, 0)),
+    ):
+        yield SampleInput(make_arg(x1_shape), args=(make_arg(x2_shape),))
+    yield SampleInput(make_arg((2, 3), noncontiguous=True), args=(make_arg((4, 3), noncontiguous=True),))
+
 def sample_inputs_cdist(op_info, device, dtype, requires_grad, **kwargs):
     small_S = 2
     test_cases = (
@@ -13192,6 +13206,21 @@ op_db: list[OpInfo] = [
                # INTERNAL ASSERT FAILED at "../torch/csrc/jit/passes/utils/check_alias_annotation.cpp":270
                DecorateInfo(unittest.expectedFailure,
                             'TestJit', 'test_variant_consistency_jit', dtypes=(torch.float32,)),
+           )),
+    OpInfo('_euclidean_dist',
+           dtypes=floating_types_and(torch.float16, torch.bfloat16),
+           supports_out=False,
+           supports_forward_ad=True,
+           supports_fwgrad_bwgrad=True,
+           supports_gradgrad=True,
+           assert_autodiffed=False,
+           sample_inputs_func=sample_inputs_euclidean_dist,
+           skips=(
+               # FakeTensor decomposes with autocast disabled, unlike the native composite.
+               DecorateInfo(unittest.expectedFailure, 'TestFakeTensor', 'test_fake_autocast',
+                            device_type='cpu', dtypes=(torch.float32,)),
+               DecorateInfo(unittest.expectedFailure, 'TestFakeTensor', 'test_fake_autocast',
+                            device_type='cuda', dtypes=(torch.float32,)),
            )),
     OpInfo('cdist',
            dtypes=floating_types(),

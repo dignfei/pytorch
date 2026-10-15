@@ -294,11 +294,25 @@ std::tuple<Tensor, Tensor> _euclidean_dist_backward(
     return std::tuple<Tensor, Tensor>(Tensor(), Tensor());
   }
   // handle case at 0 where we return a subgradient containing 0
-  Tensor ratio = grad / res;
-  ratio.masked_fill_(res == 0, 0);
+  auto zero = res == 0;
+  Tensor ratio = grad / res.masked_fill(zero, 1);
+  ratio.masked_fill_(zero, 0);
   return std::tuple<Tensor, Tensor>{
       x1 * ratio.sum(-1, true) - ratio.matmul(x2),
       x2 * ratio.sum(-2, false).unsqueeze(-1) - ratio.mT().matmul(x1)};
+}
+
+Tensor _euclidean_dist_jvp(
+    const Tensor& x1,
+    const Tensor& x2,
+    const Tensor& x1_t,
+    const Tensor& x2_t,
+    const Tensor& res) {
+  auto numerator = (x1 * x1_t).sum(-1, true) + (x2 * x2_t).sum(-1, true).mT() -
+      x1_t.matmul(x2.mT()) - x1.matmul(x2_t.mT());
+  auto zero = res == 0;
+  // Avoid 0 / 0, including when differentiating the JVP.
+  return (numerator / res.masked_fill(zero, 1)).masked_fill(zero, 0);
 }
 
 // Double backward for _cdist_backward, whose first backward is
